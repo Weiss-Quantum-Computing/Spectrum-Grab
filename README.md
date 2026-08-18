@@ -137,10 +137,30 @@ difference is that it says so rather than passing itself off as complete:
 A sweep that dies on an instrument error is written up the same way, so a fault
 on the last segment does not cost you the earlier ones.
 
-**Stitch to _x_ Hz, overlap _y_ Hz** fills the start-frequency box with segments
-that tile 0 Hz up to _x_ at the span currently in the panel, stepping by
-`span - overlap` so consecutive segments overlap and can be stitched without a
-gap at the joins.
+**Stitch to _x_ Hz, overlap _n_ points** fills the start-frequency box with
+segments that tile 0 Hz up to _x_ at the span the analyzer is on, stepping by
+`(400 - n)` bins so each segment repeats the last _n_ frequency points of the
+one before.
+
+The overlap is counted in frequency points rather than in hertz because that is
+what makes the pieces line up: stepping a whole number of bins puts the shared
+points at *the same frequencies* in both runs, so they can be matched or
+averaged directly instead of interpolated. An overlap of 0 still leaves no gap -
+the next segment starts one bin past the last point of the previous one.
+
+The bin spacing is read from the analyzer (`BVAL?` at both ends of the trace,
+divided by the 399 intervals between them) rather than derived from the span
+table, for two reasons: the table holds the manual's printed values, which are
+rounded - 390 Hz for a span that is really 390.625 - and the error would
+accumulate into a visible misalignment over a long stitch; and measuring end to
+end rather than between two adjacent bins divides the analyzer's own printed
+rounding by 399. It is also the same spacing the frequency column of the CSV is
+built from, so the overlapping points land exactly on saved data.
+
+Because the spacing comes from the instrument, Fill needs a connection, and it
+declines while the panel has a span change you have not applied yet - it would
+otherwise measure the old span. Offline it falls back to the span table and says
+in the log that the step is an estimate.
 
 ## Acquisition
 

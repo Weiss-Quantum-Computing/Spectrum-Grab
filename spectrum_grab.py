@@ -447,6 +447,24 @@ class Analyzer:
             rng = "?"
         return rng, overloads, polls
 
+    def bin_spacing(self, trace, n_bins):
+        """Hz between neighbouring bins at the span the analyzer is on.
+
+        Read from the instrument rather than worked out from the span table:
+        the table holds the manual's printed values, which are rounded (390 Hz
+        for a span that is really 390.625), and that error would accumulate into
+        a visible misalignment over a long stitch.
+
+        Measured across the whole trace rather than between two adjacent bins.
+        The analyzer prints its bin frequencies to a handful of digits, and
+        differencing neighbours would keep all of that rounding while
+        differencing end to end divides it by the number of intervals. It also
+        makes the spacing the same one trace_binary lays into the frequency
+        column of the CSV, so a stitch overlap lands on the saved points."""
+        first = self.inst.query_ascii_values(f"BVAL? {trace},0")[0]
+        last = self.inst.query_ascii_values(f"BVAL? {trace},{n_bins - 1}")[0]
+        return (last - first) / (n_bins - 1)
+
     def start(self):
         """Restart the average. Same as the [START] key."""
         self.put("STRT")
@@ -731,10 +749,10 @@ class App:
         ttk.Entry(row, textvariable=self.stitch_stop, width=8).pack(side="left",
                                                                     padx=4)
         ttk.Label(row, text="Hz, overlap").pack(side="left")
-        self.stitch_overlap = tk.StringVar(value="2")
-        ttk.Entry(row, textvariable=self.stitch_overlap, width=6).pack(side="left",
+        self.stitch_overlap = tk.StringVar(value="10")
+        ttk.Entry(row, textvariable=self.stitch_overlap, width=5).pack(side="left",
                                                                        padx=4)
-        ttk.Label(row, text="Hz").pack(side="left")
+        ttk.Label(row, text="points").pack(side="left")
         ttk.Button(row, text="Fill start freqs",
                    command=self.do_stitch).pack(side="left", padx=8)
 
@@ -1075,32 +1093,72 @@ class App:
 
     def do_stitch(self):
         """Fill the start-frequency list with segments that tile 0 Hz up to the
-        stop frequency at the span now in the panel, overlapping by the given
-        margin so the pieces can be stitched without a gap at the joins."""
-        try:
-            code = SPAN_CHOICES.index(self.set_vars["SPAN"].get())
-        except ValueError:
-            self.log("Read the analyzer first - the stitch step comes from the "
-                     "span in the panel.")
+        stop frequency, each repeating a fixed number of the previous segment's
+        frequency points.
+
+        Overlapping by points rather than by hertz is what makes the pieces line
+        up: stepping by (bins - overlap) spacings puts segment n+1's first point
+        exactly on segment n's (400 - overlap)th, so the shared points are the
+        same frequencies in both runs and can be matched or averaged directly.
+        Zero overlap still leaves no gap - the next segment starts one spacing
+        past the last point of the one before."""
+        if self.busy:
             return
         try:
             stop = float(self.stitch_stop.get())
-            overlap = float(self.stitch_overlap.get())
+            overlap = int(float(self.stitch_overlap.get()))
         except ValueError:
             self.log("Stitch stop and overlap must be numbers.")
             return
-        step = span_hz(code) - overlap
-        if step <= 0:
-            self.log(f"Overlap {overlap:g} Hz is wider than the "
-                     f"{span_hz(code):g} Hz span.")
+        if not 0 <= overlap < N_BINS:
+            self.log(f"Overlap must be from 0 to {N_BINS - 1} points.")
+            return
+        if self.edited("SPAN"):
+            self.log("Apply the span change first - the point spacing is read "
+                     "from the analyzer, so it would use the old span.")
+            return
+
+        if not self.an.inst:
+            # Offline: the span table is all there is, and its printed values
+            # are rounded, so say so rather than quietly stepping slightly wrong.
+            try:
+                code = SPAN_CHOICES.index(self.set_vars["SPAN"].get())
+            except ValueError:
+                self.log("Connect first, or pick a span, to fill the stitch.")
+                return
+            self.fill_stitch(span_hz(code) / N_BINS, stop, overlap,
+                             "estimated from the rounded span table")
+            return
+
+        self.set_busy(True)
+
+        def work():
+            try:
+                spacing = self.an.bin_spacing(TRACE, N_BINS)
+                self.root.after(0, lambda: self.fill_stitch(
+                    spacing, stop, overlap, "measured on the analyzer"))
+            except Exception as exc:
+                self.log(f"ERROR: {exc}")
+                self.an.recover()
+            finally:
+                self.root.after(0, lambda: self.set_busy(False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def fill_stitch(self, spacing, stop, overlap, source):
+        """Main thread. Lay the segments out at the given point spacing."""
+        step = (N_BINS - overlap) * spacing
+        if step <= 0 or not np.isfinite(step):
+            self.log(f"A point spacing of {spacing:g} Hz gives no usable step.")
             return
         starts, f = [], 0.0
         while f <= stop and len(starts) < 2000:
             starts.append(f)
             f += step
-        self.starts_txt.set(", ".join(f"{v:g}" for v in starts))
-        self.log(f"{len(starts)} segments of {span_hz(code):g} Hz, "
-                 f"stepping {step:g} Hz to {stop:g} Hz.")
+        self.starts_txt.set(", ".join(f"{v:.10g}" for v in starts))
+        self.log(f"{len(starts)} segments of {N_BINS} points at "
+                 f"{spacing:.6g} Hz per point ({source}), stepping "
+                 f"{N_BINS - overlap} points ({step:.6g} Hz) to {stop:g} Hz - "
+                 f"neighbours share {overlap} point(s).")
 
     def do_action(self, name, fn):
         """One-shot instrument command from a button, then re-read the panel."""
@@ -1166,7 +1224,9 @@ class App:
                         raise KeyboardInterrupt
                 for isf, start in enumerate(starts):
                     if start is not None:
-                        self.an.put(f"STRF {start:g}")
+                        # .10g, not %g: a stitch step is rarely a round number
+                        # and 6 digits would shave a fraction of a bin off it.
+                        self.an.put(f"STRF {start:.10g}")
                     for isp, span in enumerate(spans):
                         if span is not None:
                             self.an.put(f"SPAN {span}")
