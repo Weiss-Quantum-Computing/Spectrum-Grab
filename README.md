@@ -123,6 +123,20 @@ more than one run also writes
 which is the `freqs_matrix` / `amps_matrix` pair from the scripts, with the axis
 values written down next to it instead of living in a comment.
 
+**Stop** writes all of that too. A sweep cut short is written up exactly as a
+finished one - same file names, the combined plot of the segments captured so
+far - because the usual reason for stopping is that what you have is enough. The
+difference is that it says so rather than passing itself off as complete:
+
+- the matrices keep the shape the sweep was planned at, and cells no run reached
+  stay `NaN`, so the indices still line up with the axis values in the JSON and
+  nothing reads as a measurement of zero;
+- `runs_planned`, `runs_completed` and `ended_early` go in the JSON;
+- the plot title carries the shortfall, e.g. `(stopped after 3 of 8)`.
+
+A sweep that dies on an instrument error is written up the same way, so a fault
+on the last segment does not cost you the earlier ones.
+
 **Stitch to _x_ Hz, overlap _y_ Hz** fills the start-frequency box with segments
 that tile 0 Hz up to _x_ at the span currently in the panel, stepping by
 `span - overlap` so consecutive segments overlap and can be stitched without a

@@ -1140,26 +1140,30 @@ class App:
                          daemon=True).start()
 
     def _grab_worker(self, cases, starts, spans):
+        outdir = self.target_dir()
+        stamp = datetime.datetime.now().strftime("%Y%m%d")
+        total = len(cases) * len(starts) * len(spans)
+
+        # Axes kept in the shape the bench scripts used, so a sweep with one
+        # case squeezes down to their [variable, span, bin] matrices. Cells are
+        # NaN until a run fills them: a sweep that ends early is then missing
+        # data rather than carrying a floor of zeros into the analysis, and the
+        # axes still line up with the values written to the JSON beside them.
+        freqs_m = np.full((len(cases), len(starts), len(spans), N_BINS), np.nan)
+        amps_m = np.full_like(freqs_m, np.nan)
+        done = []
+        ended = ""
+
         try:
-            outdir = self.target_dir()
             os.makedirs(outdir, exist_ok=True)
-            total = len(cases) * len(starts) * len(spans)
             if total > 1:
                 self.log(f"Sweep: {len(cases)} case(s) x {len(starts)} start "
                          f"freq(s) x {len(spans)} span(s) = {total} runs")
 
-            # Axes kept in the shape the bench scripts used, so a sweep with one
-            # case squeezes down to their [variable, span, bin] matrices.
-            freqs_m = np.zeros((len(cases), len(starts), len(spans), N_BINS))
-            amps_m = np.zeros_like(freqs_m)
-            done = []
-            stamp = datetime.datetime.now().strftime("%Y%m%d")
-
             for ic, case in enumerate(cases):
                 if case and self.pause_cases.get():
                     if not self.confirm(f"Set up case '{case}', then continue."):
-                        self.log("Stopped between cases.")
-                        break
+                        raise KeyboardInterrupt
                 for isf, start in enumerate(starts):
                     if start is not None:
                         self.an.put(f"STRF {start:g}")
@@ -1182,20 +1186,30 @@ class App:
                         self.save_run(outdir, stamp, case, freqs, amps, snap,
                                       notes)
                         self.root.after(0, lambda v=snap: self.show_settings(v))
-            if len(done) > 1:
-                self.save_sweep(outdir, stamp, cases, starts, spans,
-                                freqs_m, amps_m, done)
-            self.root.after(0, self.save_config)
         except KeyboardInterrupt:
-            self.log("Stopped.")
+            ended = "stopped"
         except Exception as exc:
+            ended = "failed"
             self.log(f"ERROR: {exc}")
-        finally:
-            try:
-                self.an.lock_panel(False)
-            except Exception:
-                pass
-            self.root.after(0, lambda: self.set_busy(False))
+
+        try:
+            self.an.lock_panel(False)
+        except Exception:
+            pass
+
+        # Whatever ended the sweep, write up the runs that did complete: the
+        # point of stopping early is usually that the segments captured so far
+        # are enough, so they still get their matrices and their combined plot.
+        if ended:
+            self.log(f"{ended.capitalize()} after {len(done)} of {total} run(s).")
+        try:
+            if done and total > 1:
+                self.save_sweep(outdir, stamp, cases, starts, spans,
+                                freqs_m, amps_m, done, total, ended)
+        except Exception as exc:
+            self.log(f"ERROR: the sweep files could not be written: {exc}")
+        self.root.after(0, self.save_config)
+        self.root.after(0, lambda: self.set_busy(False))
 
     def run_one(self):
         """One measurement: range, average, read out. Returns the trace, the
@@ -1217,6 +1231,10 @@ class App:
             settle = self.float_of(self.settle_s, 0.0, "settle")
             if settle > 0:
                 time.sleep(settle)
+            if self.abort.is_set():
+                # Stopped while ranging or settling: no point restarting the
+                # average just to abandon it on the first poll.
+                raise KeyboardInterrupt
 
             timeout = self.float_of(self.timeout_s, 600.0, "timeout")
             self.log("  measuring...")
@@ -1324,11 +1342,20 @@ class App:
         self.root.after(0, lambda p=path: self.show_preview(p))
 
     def save_sweep(self, outdir, stamp, cases, starts, spans, freqs_m, amps_m,
-                   done):
+                   done, planned, ended=""):
         """The whole sweep in one place: the raw matrices, a JSON note of what
-        each axis means, and every trace on one pair of axes."""
+        each axis means, and every trace on one pair of axes.
+
+        Written the same way whether the sweep ran to the end or was stopped
+        partway, so a run cut short still gives the concatenated picture of the
+        segments it did capture. What is missing says so - unmeasured cells stay
+        NaN, the JSON counts the runs, and the plot title carries the shortfall
+        rather than passing a partial sweep off as a whole one."""
         base = unique_base(outdir, f"{self.safe_title()}_sweep_{stamp}",
                            ["_freqs.npy", "_amps.npy", "_axes.json", ".png"])
+        title = os.path.basename(base)
+        if len(done) < planned:
+            title += f"  ({ended or 'incomplete'} after {len(done)} of {planned})"
         if self.save_npy.get():
             np.save(base + "_freqs.npy", freqs_m)
             np.save(base + "_amps.npy", amps_m)
@@ -1339,16 +1366,21 @@ class App:
                 "span_codes": ["current" if s is None else s for s in spans],
                 "span_hz": ["current" if s is None else span_hz(s) for s in spans],
                 "bins": N_BINS,
+                "runs_planned": planned,
+                "runs_completed": len(done),
+                "ended_early": ended or None,
+                "unmeasured": "NaN",
             }
             with open(base + "_axes.json", "w", encoding="utf-8") as fh:
                 json.dump(axes, fh, indent=2)
             self.log(f"{os.path.basename(base)}_freqs.npy / _amps.npy "
-                     f"{freqs_m.shape}")
+                     f"{freqs_m.shape}"
+                     + (f", {len(done)} of {planned} filled"
+                        if len(done) < planned else ""))
         if self.combined.get():
             # Every run in a sweep is measured the same way, so they share a y
             # axis - the label comes from the last settings snapshot.
-            self.write_plot(base + ".png", done, os.path.basename(base),
-                            self.last_ylabel)
+            self.write_plot(base + ".png", done, title, self.last_ylabel)
 
     # -- settings panel ---------------------------------------------------
 
