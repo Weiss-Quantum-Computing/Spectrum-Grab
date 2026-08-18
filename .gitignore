@@ -1,0 +1,17 @@
+# Captured data - these belong in the lab notebook, not in git
+spectrum_data/
+*.csv
+*.png
+*.txt
+*.npy
+*.json
+
+# The bench scripts this replaces: they carry hard-coded lab paths, so they
+# stay out of the repository even if the working folder still has them.
+read_sr760fft_data*.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
