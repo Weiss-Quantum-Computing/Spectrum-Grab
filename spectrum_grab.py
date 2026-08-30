@@ -14,10 +14,13 @@ Requires: NI-488.2 (or any VISA with GPIB support) + `pip install pyvisa numpy
 Run with:  pythonw spectrum_grab.py      (pythonw = no console window)
 """
 
+import base64
 import datetime
+import io
 import json
 import os
 import queue
+import textwrap
 import threading
 import time
 import tkinter as tk
@@ -53,7 +56,19 @@ CONNECT_TIMEOUT_MS = 5000
 OP_TIMEOUT_MS = 20000
 SETTINGS_TIMEOUT_MS = 2000    # a query the analyzer dislikes costs a whole timeout
 PLOT_DPI = 300
+PEEK_DPI = 110                # a peek is only ever looked at in the preview box
 PREVIEW_W, PREVIEW_H = 440, 330
+
+# Auto offset takes the analyzer off the bus for several seconds: it accepts the
+# command and then stops answering until the DC offset has settled, so anything
+# asked in that window comes back VI_ERROR_TMO. Waiting it out means asking
+# something harmless over and over with a short timeout - the full operation
+# timeout would cost 20 s per miss - until an answer comes back. SPAN? is the
+# probe because it is the first query the settings panel makes, so an analyzer
+# that answers it is ready for the rest.
+READY_PROBE = "SPAN?"
+READY_POLL_MS = 1500
+READY_TIMEOUT_S = 45.0
 
 # Plot window used unless the trace falls outside it, and only for dB traces -
 # a linear trace is autoscaled instead.
@@ -279,6 +294,15 @@ def code_of(snap, key, default=None):
         return default
 
 
+def label_of(snap, key, default=""):
+    """The wording an enum code stands for, or `default` when the snapshot has
+    nothing usable under that key."""
+    s, code = BY_KEY.get(key), code_of(snap, key)
+    if s is None or code is None or not 0 <= code < len(s.choices or ()):
+        return default
+    return s.choices[code]
+
+
 def trace_units(snap):
     """Y-axis label implied by the measurement, display and unit codes.
 
@@ -409,6 +433,33 @@ class Analyzer:
 
     def autoscale(self):
         self.put("AUTS 0")
+
+    def wait_ready(self, probe=READY_PROBE, timeout=READY_TIMEOUT_S, poll=0.4):
+        """Block until the analyzer answers `probe` again; return how long that
+        took, or None if it never did.
+
+        Auto offset is the command this exists for. It runs on the analyzer for
+        several seconds with the bus ignored, so the settings read that used to
+        follow it straight away lost its first few queries to a timeout each -
+        the SPAN?/STRF?/CTRF? run of failures. Each probe is given a short
+        timeout of its own and the previous half-finished exchange is flushed
+        between tries, so nothing is left in the buffer for the next query to
+        read as its own reply."""
+        previous = self.inst.timeout
+        self.inst.timeout = READY_POLL_MS
+        t0 = time.time()
+        try:
+            while True:
+                try:
+                    self.get(probe)
+                    return time.time() - t0
+                except Exception:
+                    self.recover()
+                if time.time() - t0 >= timeout:
+                    return None
+                time.sleep(poll)
+        finally:
+            self.inst.timeout = previous
 
     # -- acquisition ------------------------------------------------------
 
@@ -541,9 +592,36 @@ def write_csv(path, freqs, amps, ylabel):
                header=f"Frequency (Hz),{safe_name(ylabel)}")
 
 
-def save_plot(path, traces, title, ylabel, ymin, ymax, legend=True):
-    """Draw one or more traces to a PNG. The default y window is kept unless the
-    data falls outside it, and the title says so when it had to be widened - so
+SUBTITLE_SEP = "   ·   "      # between items of the notes line under the title
+TITLE_WRAP = 58               # characters that fit across the figure at 15 pt
+SUBTITLE_WRAP = 74            # ... and at 9 pt
+
+
+def wrap_notes(bits, width=SUBTITLE_WRAP):
+    """Lay the settings items out over as few lines as they fit on, breaking
+    only between whole items - a line that fell off the edge of the figure was
+    the reason the settings were kept out of the title in the first place."""
+    lines, line = [], ""
+    for bit in bits:
+        joined = bit if not line else line + SUBTITLE_SEP + bit
+        if line and len(joined) > width:
+            lines.append(line)
+            line = bit
+        else:
+            line = joined
+    if line:
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
+              dpi=PLOT_DPI):
+    """Draw one or more traces to a PNG. `path` may be a file object, which is
+    how the peek keeps its picture out of the file system.
+
+    Titling is two lines: what the capture is, then the handful of settings that
+    decide what the trace means. The default y window is kept unless the data
+    falls outside it, and the second line says so when it had to be widened - so
     a plot that looks unlike the others is flagged rather than silently
     rescaled. Linear traces are left to autoscale."""
     fig = Figure(figsize=(8, 6))
@@ -563,14 +641,28 @@ def save_plot(path, traces, title, ylabel, ymin, ymax, legend=True):
             ymin, rescaled = low, True
         ax.set_ylim([ymin, ymax])
 
+    notes = subtitle.split(SUBTITLE_SEP) if subtitle else []
+    if rescaled:
+        notes.append("y-scale widened to fit the trace")
+    notes = wrap_notes(notes)
+
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel(ylabel)
-    ax.set_title(f"y-scale changed :: {title}" if rescaled else title)
+    # The title is the name of the capture and nothing else, so a folder of
+    # plots can be told apart at a glance; the settings that used to swamp it -
+    # and the mangled file name it used to be - go in a smaller line beneath.
+    # The room the notes need is reserved with the title's pad, because
+    # tight_layout only measures the title itself.
+    ax.set_title(textwrap.fill(title, TITLE_WRAP), fontsize=15,
+                 pad=(8 + 13 * (notes.count("\n") + 1)) if notes else 8)
+    if notes:
+        ax.text(0.5, 1.008, notes, transform=ax.transAxes, ha="center",
+                va="bottom", fontsize=9, color="#444", linespacing=1.4)
     ax.grid(True)
     if legend and 1 < len(traces) <= 12:
         ax.legend(fontsize=9)
     fig.tight_layout()
-    fig.savefig(path, dpi=PLOT_DPI)
+    fig.savefig(path, format="png", dpi=dpi)
 
 
 def metadata_text(an, snap, extra, command):
@@ -705,6 +797,12 @@ class App:
         self.grab_btn = ttk.Button(f, text="GRAB  (or press Space)",
                                    command=self.do_grab, state="disabled")
         self.grab_btn.pack(side="left", fill="x", expand=True, ipady=8)
+        self.avg_btn = ttk.Button(f, text="Start average", width=14,
+                                  command=self.do_average, state="disabled")
+        self.avg_btn.pack(side="left", padx=(6, 0), ipady=8)
+        self.peek_btn = ttk.Button(f, text="Peek (saves nothing)", width=19,
+                                   command=self.do_peek, state="disabled")
+        self.peek_btn.pack(side="left", padx=(6, 0), ipady=8)
         self.stop_btn = ttk.Button(f, text="Stop", width=6,
                                    command=self.do_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6, ipady=8)
@@ -783,11 +881,24 @@ class App:
         row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=2)
         self.do_arng = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="auto-range then freeze, for",
+        ttk.Checkbutton(row, text="before each grab, auto-range then freeze for",
                         variable=self.do_arng).pack(side="left")
         self.arng_s = tk.StringVar(value="15")
         ttk.Entry(row, textvariable=self.arng_s, width=5).pack(side="left", padx=4)
         ttk.Label(row, text="s").pack(side="left")
+
+        # The analyzer's own auto range, left switched on rather than frozen.
+        # It is in the settings panel too, but there it is an edit waiting for
+        # Apply; here it is the switch you reach for while watching a trace, so
+        # it goes to the analyzer the moment it is clicked.
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=2)
+        self.arng_live = tk.BooleanVar(value=False)
+        self.arng_chk = ttk.Checkbutton(
+            row, text="auto range (ARNG) - sent as soon as it is ticked",
+            variable=self.arng_live, command=self.toggle_autorange,
+            state="disabled")
+        self.arng_chk.pack(side="left")
 
         grid = ttk.Frame(f)
         grid.pack(fill="x", padx=6, pady=(2, 6))
@@ -852,7 +963,8 @@ class App:
                                                                        padx=4)
         self.aoff_btn = ttk.Button(bar, text="Auto-offset",
                                    command=lambda: self.do_action(
-                                       "auto offset", lambda: self.an.put("AOFF")),
+                                       "auto offset", lambda: self.an.put("AOFF"),
+                                       wait_ready=True),
                                    state="disabled")
         self.aoff_btn.pack(side="left", padx=4)
         self.auts_btn = ttk.Button(bar, text="Auto-scale",
@@ -921,8 +1033,9 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or not self.an.inst else "normal"
-        for btn in (self.grab_btn, self.read_btn, self.apply_btn,
-                    self.aoff_btn, self.auts_btn):
+        for btn in (self.grab_btn, self.avg_btn, self.peek_btn, self.read_btn,
+                    self.apply_btn, self.aoff_btn, self.auts_btn,
+                    self.arng_chk):
             btn.configure(state=state)
         # Connect is the one button that means something while disconnected.
         self.connect_btn.configure(state="disabled" if busy else "normal")
@@ -944,12 +1057,14 @@ class App:
 
     # -- preview ----------------------------------------------------------
 
-    def show_preview(self, path):
-        """Put a PNG in the preview box. Main thread only (Tk images are not
-        thread safe)."""
+    def render_preview(self, source):
+        """Put a PNG in the preview box: `source` is a file path, or PNG bytes
+        for a plot that was never written to disk. Main thread only (Tk images
+        are not thread safe)."""
         try:
             if Image is not None:
-                im = Image.open(path)
+                im = Image.open(source if isinstance(source, str)
+                                else io.BytesIO(source))
                 im.load()
                 k = min(PREVIEW_W / im.width, PREVIEW_H / im.height, 1.0)
                 if k < 1.0:
@@ -958,7 +1073,9 @@ class App:
                                    Image.LANCZOS)
                 img = ImageTk.PhotoImage(im)
             else:
-                img = tk.PhotoImage(file=path)     # Tk 8.6 reads PNG natively
+                # Tk 8.6 reads PNG natively, from a file or from base64 data.
+                img = (tk.PhotoImage(file=source) if isinstance(source, str)
+                       else tk.PhotoImage(data=base64.b64encode(source)))
                 k = 1
                 while img.width() // k > PREVIEW_W or img.height() // k > PREVIEW_H:
                     k += 1
@@ -966,13 +1083,28 @@ class App:
                     img = img.subsample(k)         # integer factors only
         except Exception as exc:
             self.log(f"  (preview failed: {exc})")
-            return
+            return False
         self.preview_img = img            # keep a reference or Tk drops it
-        self.preview_path = path
         self.preview.configure(image=img, text="")
+        return True
+
+    def show_preview(self, path):
+        if not self.render_preview(path):
+            return
+        self.preview_path = path
         self.shot_frame.configure(
             text=f"Last plot - {os.path.basename(path)}  "
                  f"(double-click to open full size)")
+
+    def show_peek(self, data):
+        """A plot held only in the window. preview_path goes to None: there is
+        no file to open, so a double-click must not reopen the last saved one
+        and pass it off as what is on screen."""
+        if not self.render_preview(data):
+            return
+        self.preview_path = None
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.shot_frame.configure(text=f"Peek at {stamp} - not saved")
 
     def load_latest_preview(self):
         outdir = self.target_dir()
@@ -1160,8 +1292,14 @@ class App:
                  f"{N_BINS - overlap} points ({step:.6g} Hz) to {stop:g} Hz - "
                  f"neighbours share {overlap} point(s).")
 
-    def do_action(self, name, fn):
-        """One-shot instrument command from a button, then re-read the panel."""
+    def do_action(self, name, fn, wait_ready=False):
+        """One-shot instrument command from a button, then re-read the panel.
+
+        `wait_ready` is for a command the analyzer goes away to work on. Reading
+        the panel back straight away would spend a VISA timeout on every query
+        it sends while the analyzer is busy, and drop those settings for the
+        rest of the session - so the read waits until the analyzer is answering
+        again."""
         if self.busy or not self.an.inst:
             return
         self.set_busy(True)
@@ -1170,6 +1308,14 @@ class App:
             try:
                 fn()
                 self.log(f"{name} sent")
+                if wait_ready:
+                    waited = self.an.wait_ready(self.probe_query())
+                    if waited is None:
+                        self.log(f"  (still no answer after {READY_TIMEOUT_S:g} s"
+                                 f" - reading the panel back anyway)")
+                    else:
+                        self.log(f"  analyzer answering again after "
+                                 f"{waited:.1f} s")
                 values = self.read_all_settings()
                 self.root.after(0, lambda v=values: self.show_settings(v))
             except Exception as exc:
@@ -1177,6 +1323,116 @@ class App:
             finally:
                 self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()
+
+    def probe_query(self):
+        """The query wait_ready polls with: the SPAN spelling this analyzer
+        turned out to answer, so a wait cannot sit out its whole timeout on a
+        query that was never going to be answered anyway."""
+        s = BY_KEY["SPAN"]
+        return s.queries[self.qform.get("SPAN", 0)]
+
+    def toggle_autorange(self):
+        """Switch the analyzer's auto range on or off there and then.
+
+        Only the checkbox fires this - setting the variable from a read-back
+        does not invoke a Checkbutton's command - so a panel refresh cannot loop
+        back round into another write."""
+        if self.busy or not self.an.inst:
+            # Put the box back where the analyzer last had it rather than
+            # leaving it showing a state that was never sent.
+            self.arng_live.set(self.set_inst.get("ARNG") == "Auto")
+            self.log("Auto range needs a free connection - nothing sent.")
+            return
+        on = self.arng_live.get()
+        self.do_action(f"auto range {'on' if on else 'off'}",
+                       lambda: self.an.put(f"ARNG {1 if on else 0}"))
+
+    def do_average(self):
+        """Restart the average and wait it out, writing nothing.
+
+        The [START] key and the wait that belongs with it: use it to leave a
+        finished average on the screen, or to see how long one takes, without
+        filling the output folder with captures nobody asked for. Stop ends the
+        wait; it does not stop the analyzer, which carries on averaging."""
+        if self.busy or not self.an.inst:
+            return
+        self.abort.clear()
+        self.set_busy(True)
+        threading.Thread(target=self._average_worker, daemon=True).start()
+
+    def _average_worker(self):
+        try:
+            timeout = self.float_of(self.timeout_s, 600.0, "timeout")
+            self.log("Average restarted - nothing will be saved.")
+            t0 = time.perf_counter()
+            self.an.start()
+            state = self.an.wait_done(timeout, stop=self.abort.is_set)
+            elapsed = time.perf_counter() - t0
+            if state == "done":
+                self.an.autoscale()
+                self.log(f"  average finished in {elapsed:.1f} s")
+            else:
+                self.log(f"  average {state} after {elapsed:.1f} s "
+                         f"(the analyzer is still running it)")
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            self.an.recover()
+        finally:
+            self.root.after(0, lambda: self.set_busy(False))
+
+    def do_peek(self):
+        """Draw the trace as it stands, into the window only.
+
+        Deliberately does not restart the average, range or settle: it reads the
+        settings and the trace and nothing else, so an average part way through
+        is left exactly as it was and can be looked at again as it builds."""
+        if self.busy or not self.an.inst:
+            return
+        self.abort.clear()
+        self.set_busy(True)
+        threading.Thread(target=self._peek_worker, daemon=True).start()
+
+    def _peek_worker(self):
+        try:
+            snap = self.read_all_settings()
+            self.root.after(0, lambda v=snap: self.show_settings(v))
+            ylabel = trace_units(snap)
+            binary = self.binary.get() and code_of(snap, "DISP0", 0) == 0
+            if self.binary.get() and not binary:
+                self.log("  (linear display: reading bin by bin, which takes a "
+                         "moment - the binary dump is a dB mapping)")
+            t0 = time.perf_counter()
+            if binary:
+                freqs, amps = self.an.trace_binary(TRACE, N_BINS)
+            else:
+                # 800 queries takes long enough that Stop has to reach it, and
+                # the progress callback is the only place inside the readout
+                # where it can be looked at.
+                def tick(i, n):
+                    self.log(f"    {i}/{n} bins")
+                    if self.abort.is_set():
+                        raise KeyboardInterrupt
+                freqs, amps = self.an.trace_ascii(TRACE, N_BINS, progress=tick)
+            i = int(np.argmax(amps))
+            self.log(f"Peek: {len(freqs)} points in "
+                     f"{time.perf_counter() - t0:.2f} s, peak {amps[i]:.2f} "
+                     f"{ylabel} at {freqs[i]:.6g} Hz - nothing saved")
+            if Figure is None:
+                self.log("  (no matplotlib: there is nothing to draw it with)")
+                return
+            png = self.plot_png(
+                [(freqs, amps, "peek")], self.plot_title(note="peek"),
+                self.plot_subtitle(snap, freqs), ylabel)
+            self.root.after(0, lambda d=png: self.show_peek(d))
+        except KeyboardInterrupt:
+            self.log("Peek stopped part way through the readout - nothing shown.")
+            self.an.recover()
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            self.an.recover()
+        finally:
+            # Not the grab path: a peek is not a run and saves no config.
+            self.root.after(0, lambda: self.set_busy(False))
 
     def do_grab(self):
         if self.busy or not self.an.inst:
@@ -1365,11 +1621,11 @@ class App:
             self.log("  (nothing ticked to save)")
             return
         base = unique_base(outdir, "_".join(parts), wanted)
-        title = os.path.basename(base)
+        stem = os.path.basename(base)
 
         if self.save_csv.get():
             write_csv(base + ".csv", freqs, amps, ylabel)
-            self.log(f"  {title}.csv")
+            self.log(f"  {stem}.csv")
         if self.save_txt.get():
             extra = {
                 "span": (f"{code} - {SPANS[code][0]}"
@@ -1383,18 +1639,73 @@ class App:
             with open(base + ".txt", "w", encoding="utf-8") as fh:
                 fh.write(metadata_text(self.an, snap, extra, self.command))
         if self.save_png.get():
-            self.write_plot(base + ".png", [(freqs, amps, title)], title, ylabel)
+            self.write_plot(base + ".png", [(freqs, amps, stem)],
+                            self.plot_title(case),
+                            self.plot_subtitle(snap, freqs, notes), ylabel)
 
-    def write_plot(self, path, traces, title, ylabel):
+    # -- plots ------------------------------------------------------------
+
+    def plot_title(self, case="", note=""):
+        """What the plot is of, in the words that were typed - the file name is
+        already on the file, and its underscored, span-coded form made a poor
+        heading for a picture that ends up in a talk or a logbook."""
+        parts = [self.title.get().strip() or "sr760"]
+        if case:
+            parts.append(case)
+        title = " - ".join(parts)
+        return f"{title}  ({note})" if note else title
+
+    @staticmethod
+    def plot_subtitle(snap, freqs, notes=None):
+        """The line under the title: the few settings that decide what the trace
+        means, spelled out. The rest stays in the metadata file."""
+        bits = []
+        code = code_of(snap, "SPAN")
+        if code is not None and 0 <= code < len(SPANS):
+            bits.append(f"span {code} - {SPANS[code][0]}")
+        if len(freqs):
+            bits.append(f"{float(freqs[0]):g} to {float(freqs[-1]):g} Hz")
+        window = label_of(snap, "WNDO")
+        if window:
+            bits.append(f"{window} window")
+        if code_of(snap, "AVGO", 0) == 1:
+            n, kind = code_of(snap, "NAVG"), label_of(snap, "AVGT")
+            bits.append(f"peak hold over {n or '?'} records" if kind == "Peak hold"
+                        else " ".join(p for p in (str(n) if n else "", kind,
+                                                  "averages") if p))
+        else:
+            bits.append("no averaging")
+        # A measurement that timed out or was stopped was read off the screen
+        # part way through, which the picture itself gives no hint of.
+        state = (notes or {}).get("measurement")
+        if state and state != "done":
+            bits.append(f"measurement {state}")
+        bits.append(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        return SUBTITLE_SEP.join(bits)
+
+    def y_window(self, ylabel):
+        """The dB plot window, or (None, None) for a linear trace, which is
+        autoscaled instead."""
+        if not ylabel.startswith("dB"):
+            return None, None
+        return (self.float_of(self.ymin, DEFAULT_YMIN, "y min"),
+                self.float_of(self.ymax, DEFAULT_YMAX, "y max"))
+
+    def plot_png(self, traces, title, subtitle, ylabel):
+        """The same plot as a PNG in memory, for the peek. Drawn coarser than a
+        saved one: it is only ever seen scaled down into the preview box."""
+        buf = io.BytesIO()
+        save_plot(buf, traces, title, subtitle, ylabel, *self.y_window(ylabel),
+                  dpi=PEEK_DPI)
+        return buf.getvalue()
+
+    def write_plot(self, path, traces, title, subtitle, ylabel):
         if Figure is None:
             self.log("  (no matplotlib: skipping the plot)")
             return
-        ymin = ymax = None
-        if ylabel.startswith("dB"):
-            ymin = self.float_of(self.ymin, DEFAULT_YMIN, "y min")
-            ymax = self.float_of(self.ymax, DEFAULT_YMAX, "y max")
         try:
-            save_plot(path, traces, title, ylabel, ymin, ymax)
+            save_plot(path, traces, title, subtitle, ylabel,
+                      *self.y_window(ylabel))
         except Exception as exc:
             self.log(f"  (plot failed: {exc})")
             return
@@ -1413,9 +1724,6 @@ class App:
         rather than passing a partial sweep off as a whole one."""
         base = unique_base(outdir, f"{self.safe_title()}_sweep_{stamp}",
                            ["_freqs.npy", "_amps.npy", "_axes.json", ".png"])
-        title = os.path.basename(base)
-        if len(done) < planned:
-            title += f"  ({ended or 'incomplete'} after {len(done)} of {planned})"
         if self.save_npy.get():
             np.save(base + "_freqs.npy", freqs_m)
             np.save(base + "_amps.npy", amps_m)
@@ -1440,7 +1748,12 @@ class App:
         if self.combined.get():
             # Every run in a sweep is measured the same way, so they share a y
             # axis - the label comes from the last settings snapshot.
-            self.write_plot(base + ".png", done, title, self.last_ylabel)
+            subtitle = SUBTITLE_SEP.join(
+                [f"{len(done)} of {planned} runs"
+                 + (f" - {ended}" if ended else ""),
+                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
+            self.write_plot(base + ".png", done, self.plot_title(note="sweep"),
+                            subtitle, self.last_ylabel)
 
     # -- settings panel ---------------------------------------------------
 
@@ -1483,6 +1796,8 @@ class App:
                 kept += 1
         if values:
             self.last_ylabel = trace_units(values)
+        if "ARNG" in values:
+            self.arng_live.set(code_of(values, "ARNG", 0) == 1)
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
         if kept:
             self.log(f"  (panel: kept {kept} unapplied edit(s), the analyzer "

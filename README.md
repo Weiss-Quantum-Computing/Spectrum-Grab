@@ -14,7 +14,9 @@ you get, in your chosen folder:
 | `<name>.txt` | Metadata: span, start frequency, window, averaging, input range and every other setting, each with the command that would put it back |
 
 The panel shows the most recent plot inline; double-click it to open the
-full-resolution PNG.
+full-resolution PNG. **Peek** draws the trace into that same box without
+writing anything, and **Start average** restarts the average and waits it out
+without writing anything either - so looking is never the same as collecting.
 
 ## Requirements
 
@@ -49,9 +51,20 @@ GPIB resource instead and take the first one that identifies as an SR760.
 - **Space** grabs, except while the focus is in a text field or on a control
   that uses the space bar itself, so typing a space in the title box does not
   fire an acquisition.
+- **Start average** - restarts the average (`STRT`, the front panel's START
+  key) and waits for it to finish, then autoscales. No trace is read and no
+  file is written: use it to leave a finished average on the screen, or to find
+  out how long one takes, without filling the folder with captures nobody
+  asked for. Stop ends the wait, not the analyzer's average.
+- **Peek (saves nothing)** - reads the trace as it stands and plots it in the
+  preview box, writing nothing. It does not restart, range or settle, so an
+  average part way through is left exactly as it was and can be looked at again
+  as it builds. The frame says `not saved` and double-click does nothing, so a
+  peek can never be mistaken for a capture. Peak amplitude and its frequency go
+  in the log.
 - **Auto-grab** - repeat on a fixed interval.
 - **Stop** - ends a sweep after the step in progress and releases the front
-  panel.
+  panel. It also ends a Start average wait and a peek's bin-by-bin readout.
 
 ## File names
 
@@ -90,7 +103,13 @@ every run - PSD, LogMag, Vrms, Hanning, 1000 linear RMS averages, input A, AC,
 float, auto range and auto offset on, 390 Hz span from 0 Hz. Nothing is sent
 until you press Apply, so you can look the whole block over first.
 
-**Auto-offset** and **Auto-scale** send `AOFF` and `AUTS 0`.
+**Auto-offset** and **Auto-scale** send `AOFF` and `AUTS 0`. Auto offset runs
+on the analyzer for several seconds with the bus ignored, so the panel read that
+follows waits until the analyzer answers `SPAN?` again before asking anything
+else - reading straight away spent a VISA timeout on each of the first few
+queries and dropped those settings for the rest of the session, which is where
+the `SPAN? / STRF? / CTRF? failed: VI_ERROR_TMO` run of failures came from. The
+log says how long the wait took.
 
 Settings traffic and captures share one VISA session, so they are serialised:
 the buttons grey out while a measurement is running and vice versa, and Connect
@@ -173,7 +192,12 @@ in the log that the step is an estimate.
 - **lock front panel while measuring** - `OVRM 0` for the duration of the
   measurement, so a stray knob cannot change the settings the metadata claims
   were used. It is released again even if the run fails.
-- **auto-range then freeze** - the scripts' ranging routine: auto range on,
+- **auto range (ARNG)** - the analyzer's own auto range, left switched on
+  rather than frozen. It is in the settings panel too, but there it is an edit
+  waiting for Apply; the checkbox goes to the analyzer the moment it is
+  clicked, and follows the instrument again on the next read, so it always
+  shows what `ARNG` actually is.
+- **before each grab, auto-range then freeze** - the scripts' ranging routine: auto range on,
   leave it long enough to settle while watching the overload bits, then back to
   manual so the range stays put for the rest of the sweep and the noise floors
   stay comparable. The range it settled on and how often an overload showed up
@@ -184,9 +208,30 @@ in the log that the step is an estimate.
   expiry the trace is read as it stands and the log says so, rather than hanging
   forever.
 - **plot y min / y max** - the default plot window. It is kept unless the trace
-  falls outside it, and the plot title says `y-scale changed ::` when it had to
-  be widened, so a plot that does not compare with the others is flagged. Only
-  used for dB traces; a linear trace is autoscaled.
+  falls outside it, and the notes line under the plot title says `y-scale
+  widened to fit the trace` when it had to be widened, so a plot that does not
+  compare with the others is flagged. Only used for dB traces; a linear trace is
+  autoscaled.
+
+## Plot titling
+
+The title is what the capture is, in the words that were typed: the **Title**
+box, plus the case when sweeping cases, plus `(sweep)` or `(peek)` where that
+applies. The file name is on the file already, and its underscored, span-coded
+form made a poor heading for a picture that ends up in a talk or a logbook.
+
+Underneath it, in smaller grey type, is the handful of settings that decide what
+the trace means, read from the same snapshot the metadata file is written from:
+
+```
+span 11 - 390 Hz  .  0 to 390 Hz  .  Hanning window  .  1000 RMS averages  .  2026-08-30 19:03
+```
+
+A measurement that timed out or was stopped says so there too, since the picture
+itself gives no hint of it, and so does a widened y-scale. The line wraps
+between whole items rather than running off the edge of the figure, and a long
+title wraps as well. A combined sweep plot gets `N of M runs` instead of the
+per-capture settings.
 
 ## Units
 
