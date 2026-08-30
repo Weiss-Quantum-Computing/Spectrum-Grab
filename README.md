@@ -56,6 +56,14 @@ GPIB resource instead and take the first one that identifies as an SR760.
   file is written: use it to leave a finished average on the screen, or to find
   out how long one takes, without filling the folder with captures nobody
   asked for. Stop ends the wait, not the analyzer's average.
+
+  Only a *linear* average ever reports itself finished. An exponential average
+  goes on re-weighting the newest record forever, and with averaging off nothing
+  is counting at all, so in both cases there is no completion bit to wait for
+  and the **exponential wait** below decides how long it runs instead. At 0 s
+  the app just sends `STRT` and hands the GUI straight back. The averaging mode
+  is asked of the analyzer each time, since it is one knob turn away on the
+  front panel.
 - **Peek (saves nothing)** - reads the trace as it stands and plots it in the
   preview box, writing nothing. It does not restart, range or settle, so an
   average part way through is left exactly as it was and can be looked at again
@@ -188,7 +196,11 @@ in the log that the step is an estimate.
   dB mapping of the display, so it is only used while the display is LogMag;
   with a linear display the app falls back to the bin-by-bin readout on its own
   and says so in the log. Bin 0 is read the slow way either way and used to put
-  the dump back on the analyzer's own scale.
+  the dump back on the analyzer's own scale - in dB when the units are dBV or
+  dBVrms, and through dB and back out again when they are Vpk or Vrms, since
+  `SPEC?` then answers in volts. A bin 0 with no dB equivalent (zero or
+  negative) drops the capture to the bin-by-bin readout rather than returning a
+  trace that is quietly wrong.
 - **lock front panel while measuring** - `OVRM 0` for the duration of the
   measurement, so a stray knob cannot change the settings the metadata claims
   were used. It is released again even if the run fails.
@@ -204,14 +216,22 @@ in the log that the step is an estimate.
   go in the metadata.
 - **settle before start** - dead time between setting the span and starting the
   average, for anything that needs to ring down first.
-- **measurement timeout** - how long to wait for the average to finish. On
-  expiry the trace is read as it stands and the log says so, rather than hanging
-  forever.
-- **plot y min / y max** - the default plot window. It is kept unless the trace
-  falls outside it, and the notes line under the plot title says `y-scale
-  widened to fit the trace` when it had to be widened, so a plot that does not
-  compare with the others is flagged. Only used for dB traces; a linear trace is
-  autoscaled.
+- **measurement timeout** - how long to wait for a *linear* average to finish.
+  On expiry the trace is read as it stands and the log says so, rather than
+  hanging forever.
+- **exponential wait** - how long to let an average run when it has no finish of
+  its own: exponential averaging, or averaging switched off. Neither ever sets
+  the completion bit, so there is nothing to wait for and the run length has to
+  be stated instead. The measurement timeout is the wrong knob for it - that is
+  the limit on a wait that normally ends by itself, so reusing it made every
+  such capture take the full ten minutes. Stop cuts the wait short. The
+  metadata and the plot notes record what actually happened,
+  `30 s of exponential averaging`, rather than calling it a timeout.
+- **plot y min / y max** - the default plot window, for dB traces only. It is
+  kept unless the trace falls outside it, and the notes line under the plot
+  title says `y-scale widened to fit the trace` when it had to be widened, so a
+  plot that does not compare with the others is flagged. A volt trace is
+  autoscaled instead, on the axis the Display setting implies.
 
 ## Plot titling
 
@@ -237,10 +257,30 @@ per-capture settings.
 
 The CSV header, the y-axis label and the metadata all come from the analyzer's
 own `MEAS`, `DISP` and `UNIT` codes rather than being typed in: PSD adds
-`/sqrtHz`, a phase display gives `deg` or `rad`, and a LogMag display gives dB
-even when the units are set to volts - which is why the scripts that hard-coded
-`dbV` while `UNIT` said Vrms were right by accident. Change the units on the
-analyzer and the files follow.
+`/sqrtHz`, and a phase display gives `deg` or `rad`. Change the units on the
+analyzer and the files follow. Plots print it as `Vpk/√Hz`; the CSV header and
+the metadata keep the ASCII `sqrtHz`.
+
+The **y axis follows the Display setting**, so the plot is drawn the way the
+analyzer is drawing it. Only LogMag on volt units gets a log axis: dB data is a
+log axis already - taking the log of it again means nothing, and a dB reading is
+usually negative, which a log axis cannot draw at all - while Real and Imag are
+signed linear quantities and Phase is degrees or radians. A volt trace that
+reaches zero cannot go on a log axis either, so it is drawn linear and the notes
+under the title say why.
+
+**`UNIT` alone decides the scale the data comes back on.** The display mode does
+not - a LogMag display with Vpk units still answers `SPEC?` in volts. This is
+measured rather than assumed: a floor the analyzer drew at 10 nV/√Hz, and called
+-161 dBV/√Hz once its units were switched to dBV, is 1e-8 V, and 1e-8 V is what
+`SPEC?` returned while the display was on LogMag.
+
+Getting that backwards did real damage. The old rule claimed dB whenever the
+display was LogMag, which mislabelled every volt-unit trace, and - because the
+binary dump is rebased on bin 0 read with `SPEC?` - added a linear value to a dB
+trace. That pinned bin 0 near zero and dragged the rest of the trace with it, so
+the 10 nV/√Hz floor above came out of the app at about 0 dBVpk/√Hz, some 160 dB
+adrift. Captures taken in dBV or dBVrms were never affected.
 
 ## Remembered settings
 

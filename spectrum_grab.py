@@ -70,6 +70,12 @@ READY_PROBE = "SPAN?"
 READY_POLL_MS = 1500
 READY_TIMEOUT_S = 45.0
 
+# How long to let an average run when it has no finish of its own - exponential
+# averaging, or averaging switched off. The measurement timeout is the wrong
+# knob for this: it is meant as the limit on a wait that normally ends by
+# itself, so reusing it means every such capture takes the whole ten minutes.
+DEFAULT_EXP_WAIT_S = 30.0
+
 # Plot window used unless the trace falls outside it, and only for dB traces -
 # a linear trace is autoscaled instead.
 DEFAULT_YMIN, DEFAULT_YMAX = -160.0, -20.0
@@ -304,12 +310,17 @@ def label_of(snap, key, default=""):
 
 
 def trace_units(snap):
-    """Y-axis label implied by the measurement, display and unit codes.
+    """Y-axis label implied by the measurement and unit codes, in plain ASCII -
+    it goes in the CSV header and the metadata as well as on the plot.
 
-    A LogMag display hands back dB even when the units are set to volts, which
-    is why the scripts that hard-coded 'dbV' were right by accident - so the
-    label follows the display mode as well as UNIT, and PSD adds the per root
-    hertz that a spectrum does not have."""
+    UNIT alone decides the scale the data comes back on. The display mode does
+    not: a LogMag display with Vpk units still answers SPEC? in volts. This was
+    measured, not assumed - a floor the analyzer drew at 10 nV/sqrtHz, and
+    called -161 dBV/sqrtHz once its units were switched to dBV, is 1e-8 V, and
+    that is what SPEC? returned while the display was on LogMag. The old rule
+    here claimed dB whenever the display was LogMag, which mislabelled every
+    volt-unit trace and, worse, let the binary dump rebase a dB trace with a
+    linear number. PSD adds the per root hertz that a spectrum does not have."""
     meas = code_of(snap, "MEAS0", 0)
     disp = code_of(snap, "DISP0", 0)
     unit = code_of(snap, "UNIT0", 2)
@@ -317,12 +328,40 @@ def trace_units(snap):
         unit = 2
     if disp == 4:                                     # phase
         return "deg" if unit == 0 else "rad"
-    log_scale = disp == 0 or unit in (2, 3)
-    label = (("dBVpk", "dBVrms", "dBV", "dBVrms") if log_scale
-             else ("Vpk", "Vrms", "V", "Vrms"))[unit]
+    label = ("Vpk", "Vrms", "dBV", "dBVrms")[unit]
     if meas == 1:                                     # PSD
         label += "/sqrtHz"
     return label
+
+
+def pretty_units(label):
+    """The same label for a plot axis, where the root sign can be drawn."""
+    return label.replace("/sqrtHz", "/√Hz")
+
+
+def reads_in_db(snap):
+    """Whether the trace comes back in dB rather than in volts."""
+    return code_of(snap, "UNIT0", 2) in (2, 3)
+
+
+def trace_yscale(snap):
+    """The y axis the analyzer is drawing this trace on, so the plot matches the
+    screen: "log" or "linear".
+
+    Only volt data ever gets a log axis. dB data is a log axis already - taking
+    the log of it again means nothing, and a dB reading is usually negative,
+    which a log axis cannot draw at all. Of the display modes only LogMag is
+    logarithmic: Real and Imag are signed linear quantities and Phase is degrees
+    or radians."""
+    if reads_in_db(snap):
+        return "linear"
+    return "log" if code_of(snap, "DISP0", 0) == 0 else "linear"
+
+
+def binary_valid(snap):
+    """Whether the SPEB? dump can be used for the readout in force. The counts
+    are a dB mapping of the LogMag display, so the display has to be on it."""
+    return code_of(snap, "DISP0", 0) == 0
 
 
 def span_hz(code):
@@ -560,24 +599,42 @@ class Analyzer:
                 progress(i + 1, n_bins)
         return np.array(freqs), np.array(amps)
 
-    def trace_binary(self, trace, n_bins):
+    def trace_binary(self, trace, n_bins, in_db=True):
         """SPEB? dump: the whole trace as int16 display counts in one read, some
         two orders of magnitude faster than asking bin by bin.
 
         The counts carry a dB mapping, so this is only valid while the display
         is LogMag - the caller checks before choosing it. Bin 0 is also read the
-        slow way and used to put the dump back on the analyzer's own scale,
-        which absorbs whatever reference the chosen units imply."""
+        slow way with SPEC? and used to put the dump back on the analyzer's own
+        scale, which absorbs whatever reference the chosen units imply.
+
+        `in_db` says which scale SPEC? is answering on, which is decided by UNIT
+        and nothing else. On dBV or dBVrms the rebase is a straight offset. On
+        Vpk or Vrms it is not: SPEC? hands back volts, and adding a linear value
+        to a dB trace pinned bin 0 near zero and dragged the rest of the trace
+        with it - a floor the analyzer drew at 10 nV/sqrtHz came out of the app
+        at about 0 dBVpk/sqrtHz, some 160 dB adrift. So bin 0 goes into dB for
+        the rebase and the whole trace comes back out of it afterwards; 20 log10
+        is the right conversion here, the same one that makes the analyzer's own
+        10 nV/sqrtHz and -161 dBV/sqrtHz two readings of one noise floor."""
         start_freq = self.inst.query_ascii_values(f"BVAL? {trace},0")[0]
         stop_freq = self.inst.query_ascii_values(f"BVAL? {trace},{n_bins - 1}")[0]
         freqs = np.linspace(start_freq, stop_freq, n_bins)
 
         first_bin = self.inst.query_ascii_values(f"SPEC? {trace},0")[0]
+        if not in_db and not first_bin > 0:
+            # No dB reference to rebase against, so say so and let the caller
+            # fall back rather than return a trace that is quietly wrong.
+            raise ValueError(f"bin 0 reads {first_bin:g}, which has no dB "
+                             f"equivalent to rebase the binary dump against")
         self.inst.write(f"SPEB? {trace}")
         raw = self.inst.read_bytes(2 * n_bins, break_on_termchar=False)
         counts = np.frombuffer(raw, dtype="<i2")
         amps = (3.0103 * counts) / 512.0 - 114.3914
-        return freqs, amps + (first_bin - amps[0])
+        if in_db:
+            return freqs, amps + (first_bin - amps[0])
+        amps = amps + (20.0 * np.log10(first_bin) - amps[0])
+        return freqs, 10.0 ** (amps / 20.0)
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +672,7 @@ def wrap_notes(bits, width=SUBTITLE_WRAP):
 
 
 def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
-              dpi=PLOT_DPI):
+              dpi=PLOT_DPI, yscale="linear"):
     """Draw one or more traces to a PNG. `path` may be a file object, which is
     how the peek keeps its picture out of the file system.
 
@@ -644,10 +701,19 @@ def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
     notes = subtitle.split(SUBTITLE_SEP) if subtitle else []
     if rescaled:
         notes.append("y-scale widened to fit the trace")
+    if yscale == "log":
+        # A log axis cannot draw a zero or a negative bin, so a trace that
+        # reaches one is drawn linear instead and the notes say why rather than
+        # leaving a plot that quietly disagrees with the analyzer's screen.
+        if min(float(np.min(a)) for _, a, _ in traces) > 0:
+            ax.set_yscale("log")
+            ax.grid(True, which="minor", alpha=0.3)
+        else:
+            notes.append("linear y-scale: the trace reaches zero")
     notes = wrap_notes(notes)
 
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel(ylabel)
+    ax.set_ylabel(pretty_units(ylabel))
     # The title is the name of the capture and nothing else, so a folder of
     # plots can be told apart at a glance; the settings that used to swamp it -
     # and the mangled file name it used to be - go in a smaller line beneath.
@@ -696,6 +762,7 @@ def metadata_text(an, snap, extra, command):
 
 class App:
     last_ylabel = "dBV"       # unit of the most recent snapshot, for sweep plots
+    last_yscale = "linear"    # ... and the axis the analyzer draws it on
 
     def __init__(self, root):
         self.root = root
@@ -902,11 +969,16 @@ class App:
 
         grid = ttk.Frame(f)
         grid.pack(fill="x", padx=6, pady=(2, 6))
-        for i, (label, attr, default) in enumerate(
+        for i, item in enumerate(
                 (("settle before start (s)", "settle_s", "0"),
                  ("measurement timeout (s)", "timeout_s", "600"),
+                 ("exponential wait (s)", "exp_wait_s", f"{DEFAULT_EXP_WAIT_S:g}"),
+                 None,                  # keeps the plot window on a row of its own
                  ("plot y min (dB)", "ymin", f"{DEFAULT_YMIN:g}"),
                  ("plot y max (dB)", "ymax", f"{DEFAULT_YMAX:g}"))):
+            if item is None:
+                continue
+            label, attr, default = item
             r, c = divmod(i, 2)
             ttk.Label(grid, text=label + ":").grid(row=r, column=c * 2,
                                                    sticky="e", padx=(0, 4), pady=1)
@@ -1136,7 +1208,8 @@ class App:
             "combined": self.combined, "pause_cases": self.pause_cases,
             "binary": self.binary, "lock": self.lock, "autorange": self.do_arng,
             "autorange_s": self.arng_s, "settle_s": self.settle_s,
-            "timeout_s": self.timeout_s, "ymin": self.ymin, "ymax": self.ymax,
+            "timeout_s": self.timeout_s, "exp_wait_s": self.exp_wait_s,
+            "ymin": self.ymin, "ymax": self.ymax,
             "interval": self.interval,
         }
 
@@ -1362,15 +1435,33 @@ class App:
 
     def _average_worker(self):
         try:
-            timeout = self.float_of(self.timeout_s, 600.0, "timeout")
-            self.log("Average restarted - nothing will be saved.")
+            finishes, how = self.average_finishes()
+            dwell = self.exp_wait()
+            if not finishes and dwell <= 0:
+                # Nothing to wait for and no dwell asked for, so STRT is the
+                # button's whole job. Waiting on the completion bit anyway would
+                # hold the GUI - and the analyzer's front panel - until the
+                # timeout or Stop, which is what it used to do.
+                self.an.start()
+                self.log(f"Average restarted and left running - {how} has no "
+                         f"finish to wait for. Nothing saved.")
+                return
+            if finishes:
+                self.log(f"Average restarted - {how}, nothing will be saved.")
+            else:
+                self.log(f"Average restarted - {how} has no finish to wait for, "
+                         f"so letting it build for {dwell:g} s. Nothing saved.")
             t0 = time.perf_counter()
             self.an.start()
-            state = self.an.wait_done(timeout, stop=self.abort.is_set)
+            state = (self.an.wait_done(self.float_of(self.timeout_s, 600.0,
+                                                     "timeout"),
+                                       stop=self.abort.is_set)
+                     if finishes else self.wait_out(dwell))
             elapsed = time.perf_counter() - t0
             if state == "done":
                 self.an.autoscale()
-                self.log(f"  average finished in {elapsed:.1f} s")
+                self.log(f"  {'average finished' if finishes else 'ran'} in "
+                         f"{elapsed:.1f} s")
             else:
                 self.log(f"  average {state} after {elapsed:.1f} s "
                          f"(the analyzer is still running it)")
@@ -1397,14 +1488,19 @@ class App:
             snap = self.read_all_settings()
             self.root.after(0, lambda v=snap: self.show_settings(v))
             ylabel = trace_units(snap)
-            binary = self.binary.get() and code_of(snap, "DISP0", 0) == 0
+            binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:
                 self.log("  (linear display: reading bin by bin, which takes a "
                          "moment - the binary dump is a dB mapping)")
             t0 = time.perf_counter()
             if binary:
-                freqs, amps = self.an.trace_binary(TRACE, N_BINS)
-            else:
+                try:
+                    freqs, amps = self.an.trace_binary(TRACE, N_BINS,
+                                                       reads_in_db(snap))
+                except ValueError as exc:
+                    self.log(f"  ({exc} - reading bin by bin instead)")
+                    binary = False
+            if not binary:
                 # 800 queries takes long enough that Stop has to reach it, and
                 # the progress callback is the only place inside the readout
                 # where it can be looked at.
@@ -1414,15 +1510,18 @@ class App:
                         raise KeyboardInterrupt
                 freqs, amps = self.an.trace_ascii(TRACE, N_BINS, progress=tick)
             i = int(np.argmax(amps))
+            # .4g rather than .2f: a volt-unit trace is a handful of nanovolts,
+            # which two decimal places would round away to 0.00.
             self.log(f"Peek: {len(freqs)} points in "
-                     f"{time.perf_counter() - t0:.2f} s, peak {amps[i]:.2f} "
-                     f"{ylabel} at {freqs[i]:.6g} Hz - nothing saved")
+                     f"{time.perf_counter() - t0:.2f} s, peak {amps[i]:.4g} "
+                     f"{pretty_units(ylabel)} at {freqs[i]:.6g} Hz - "
+                     f"nothing saved")
             if Figure is None:
                 self.log("  (no matplotlib: there is nothing to draw it with)")
                 return
             png = self.plot_png(
                 [(freqs, amps, "peek")], self.plot_title(note="peek"),
-                self.plot_subtitle(snap, freqs), ylabel)
+                self.plot_subtitle(snap, freqs), ylabel, trace_yscale(snap))
             self.root.after(0, lambda d=png: self.show_peek(d))
         except KeyboardInterrupt:
             self.log("Peek stopped part way through the readout - nothing shown.")
@@ -1552,15 +1651,34 @@ class App:
                 # average just to abandon it on the first poll.
                 raise KeyboardInterrupt
 
-            timeout = self.float_of(self.timeout_s, 600.0, "timeout")
-            self.log("  measuring...")
+            finishes, how = self.average_finishes()
             t0 = time.perf_counter()
-            self.an.start()
-            state = self.an.wait_done(timeout, stop=self.abort.is_set)
+            if finishes:
+                self.log("  measuring...")
+                self.an.start()
+                state = self.an.wait_done(
+                    self.float_of(self.timeout_s, 600.0, "timeout"),
+                    stop=self.abort.is_set)
+            else:
+                # No completion bit is coming, so the run length has to be said
+                # rather than waited for. The measurement timeout is not it -
+                # that is the limit on a wait that normally ends by itself, and
+                # using it here made every such capture take the full ten
+                # minutes.
+                dwell = self.exp_wait()
+                self.log(f"  measuring... ({how} has no finish to wait for, so "
+                         f"the trace is read after {dwell:g} s)")
+                self.an.start()
+                state = self.wait_out(dwell)
             measured = time.perf_counter() - t0
             if state == "stopped":
                 raise KeyboardInterrupt
-            if state != "done":
+            if state == "done" and not finishes:
+                # Not a measurement that finished on its own: it ran for as long
+                # as it was told to, and the metadata should say which.
+                state = f"{measured:.0f} s of {how}"
+                self.log(f"  read after {measured:.1f} s")
+            elif state != "done":
                 self.log(f"  (measurement {state} after {measured:.1f} s - "
                          f"reading the trace as it stands)")
             else:
@@ -1573,16 +1691,20 @@ class App:
             # whether the binary dump is valid, and the same snapshot goes in
             # the metadata and the panel.
             snap = self.read_all_settings()
-            log_display = code_of(snap, "DISP0", 0) == 0
-            binary = self.binary.get() and log_display
+            binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:
                 self.log("  (linear display: falling back to the ASCII readout, "
                          "the binary dump is a dB mapping)")
 
             t0 = time.perf_counter()
             if binary:
-                freqs, amps = self.an.trace_binary(TRACE, N_BINS)
-            else:
+                try:
+                    freqs, amps = self.an.trace_binary(TRACE, N_BINS,
+                                                       reads_in_db(snap))
+                except ValueError as exc:
+                    self.log(f"  ({exc} - reading bin by bin instead)")
+                    binary = False
+            if not binary:
                 freqs, amps = self.an.trace_ascii(
                     TRACE, N_BINS,
                     progress=lambda i, n: self.log(f"    {i}/{n} bins"))
@@ -1641,7 +1763,8 @@ class App:
         if self.save_png.get():
             self.write_plot(base + ".png", [(freqs, amps, stem)],
                             self.plot_title(case),
-                            self.plot_subtitle(snap, freqs, notes), ylabel)
+                            self.plot_subtitle(snap, freqs, notes), ylabel,
+                            trace_yscale(snap))
 
     # -- plots ------------------------------------------------------------
 
@@ -1691,21 +1814,22 @@ class App:
         return (self.float_of(self.ymin, DEFAULT_YMIN, "y min"),
                 self.float_of(self.ymax, DEFAULT_YMAX, "y max"))
 
-    def plot_png(self, traces, title, subtitle, ylabel):
+    def plot_png(self, traces, title, subtitle, ylabel, yscale="linear"):
         """The same plot as a PNG in memory, for the peek. Drawn coarser than a
         saved one: it is only ever seen scaled down into the preview box."""
         buf = io.BytesIO()
         save_plot(buf, traces, title, subtitle, ylabel, *self.y_window(ylabel),
-                  dpi=PEEK_DPI)
+                  dpi=PEEK_DPI, yscale=yscale)
         return buf.getvalue()
 
-    def write_plot(self, path, traces, title, subtitle, ylabel):
+    def write_plot(self, path, traces, title, subtitle, ylabel,
+                   yscale="linear"):
         if Figure is None:
             self.log("  (no matplotlib: skipping the plot)")
             return
         try:
             save_plot(path, traces, title, subtitle, ylabel,
-                      *self.y_window(ylabel))
+                      *self.y_window(ylabel), yscale=yscale)
         except Exception as exc:
             self.log(f"  (plot failed: {exc})")
             return
@@ -1753,7 +1877,7 @@ class App:
                  + (f" - {ended}" if ended else ""),
                  datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
             self.write_plot(base + ".png", done, self.plot_title(note="sweep"),
-                            subtitle, self.last_ylabel)
+                            subtitle, self.last_ylabel, self.last_yscale)
 
     # -- settings panel ---------------------------------------------------
 
@@ -1796,6 +1920,7 @@ class App:
                 kept += 1
         if values:
             self.last_ylabel = trace_units(values)
+            self.last_yscale = trace_yscale(values)
         if "ARNG" in values:
             self.arng_live.set(code_of(values, "ARNG", 0) == 1)
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1803,6 +1928,68 @@ class App:
             self.log(f"  (panel: kept {kept} unapplied edit(s), the analyzer "
                      f"reports something else)")
         self.refresh_marks()
+
+    def read_settings(self, *keys):
+        """A few settings rather than the whole panel, each in the query form it
+        turned out to answer. Instrument thread only.
+
+        A query that fails falls back to what the panel last saw, so a decision
+        made on the answer is taken on a stale value rather than on a default
+        that happens to be wrong."""
+        out = {}
+        for key in keys:
+            s = BY_KEY[key]
+            try:
+                out[key] = self.an.get(s.queries[self.qform.get(key, 0)])
+                continue
+            except Exception:
+                self.an.recover()
+            try:
+                out[key] = parse_setting(s, self.set_inst.get(key, ""))
+            except ValueError:
+                pass
+        return out
+
+    def wait_out(self, seconds):
+        """Let an average that has no finish of its own run for a set time.
+
+        Polled in short steps rather than slept through in one go, so Stop is
+        felt at once. Answers in wait_done's vocabulary, so the two are
+        interchangeable at the call sites."""
+        deadline = time.time() + seconds
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return "done"
+            if self.abort.is_set():
+                return "stopped"
+            time.sleep(min(0.25, left))
+
+    def exp_wait(self):
+        return self.float_of(self.exp_wait_s, DEFAULT_EXP_WAIT_S,
+                             "exponential wait")
+
+    def average_finishes(self):
+        """Whether an average started now will ever report itself finished, and
+        a short phrase naming the averaging - short because it ends up in the
+        metadata and on the plot as well as in the log.
+
+        Bit 0 of the poll byte sets when a linear average reaches its count. An
+        exponential average never reaches one - it goes on re-weighting the
+        newest record forever - and with averaging off nothing is counting at
+        all, so in both cases the bit wait_done watches for is never coming and
+        the wait can only end at the timeout or at Stop.
+
+        Asked of the analyzer rather than taken from the panel, because the
+        averaging mode is one knob turn away on the front panel and this is the
+        difference between a wait that ends and one that does not."""
+        snap = self.read_settings("AVGO", "AVGM", "NAVG")
+        if code_of(snap, "AVGO", 0) != 1:
+            return False, "no averaging"
+        if code_of(snap, "AVGM", 0) != 0:
+            return False, "exponential averaging"
+        n = code_of(snap, "NAVG")
+        return True, f"{n} linear averages" if n else "linear averaging"
 
     def read_all_settings(self, retry_all=False):
         """Instrument thread only. Returns the analyzer's own replies as
