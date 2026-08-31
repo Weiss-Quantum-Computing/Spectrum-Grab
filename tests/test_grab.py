@@ -86,6 +86,8 @@ class FakeAn:
         self.qform = {}
         self.sent = []
         self._status = None
+        self._pre_start = None
+        self.latched = (0, 0)          # what start() will find already set
         self.last_raw = {}
 
     def command(self, key, value):
@@ -134,9 +136,20 @@ class FakeAn:
     def input_range(self):
         return float(self.snap.get("IRNG", "-30"))
 
-    def start(self):
+    def start(self, log=None):
+        # Mirrors the real one: consume whatever was latched before the run,
+        # keep it, then drop the cache so the post-run read stands alone.
+        # `latched` is what a swap transient would have left behind.
+        self._pre_start = S.Status(*self.latched, at=time.perf_counter())
+        if log is not None and self._pre_start.overloaded:
+            log("  (an overload flag was already latched before this run - "
+                "cleared, and not counted against it)")
+        self.latched = (0, 0)
         self._status = None
         self.sent.append("STRT")
+
+    def pre_start(self):
+        return self._pre_start
 
     def wait_done(self, timeout, stop=None, poll=0.25):
         return "done"
@@ -1945,6 +1958,36 @@ ok("... numbered from one within each, to match the segment column",
    meta.count("\n     1 ") == 4 and meta.count("\n     2 ") == 4,
    f"{meta.count(chr(10) + '     1 ')} firsts, "
    f"{meta.count(chr(10) + '     2 ')} seconds")
+
+# ---------------------------------------------------------------------------
+# ERRS bit 7 latches, so a transient from before the run - swapping a resistor
+# on a live input - used to be reported as though the average had overloaded.
+# Measured 31 Aug 2026: every span-11 Johnson trace came back flagged, 50 ohm
+# included, and the flagged traces agreed with the unflagged ones to 0.16 dB.
+# ---------------------------------------------------------------------------
+
+an = FakeAn(GOOD)
+an.latched = (1 << S.ERRS_OVERLOAD_BIT, 0)
+notes = []
+an.start(log=notes.append)
+ok("start() consumes a flag latched before the run",
+   an.pre_start().overloaded is True)
+ok("... and says so rather than swallowing it",
+   any("already latched" in m for m in notes), " | ".join(notes))
+ok("... leaving the run itself clean",
+   an.refresh_status().overloaded is False)
+
+an = FakeAn(GOOD)
+an.start()
+ok("a clean start leaves nothing to report",
+   an.pre_start().overloaded is False and an.refresh_status().overloaded is False)
+
+an = FakeAn(GOOD, errs=1 << S.ERRS_OVERLOAD_BIT)
+an.start()
+ok("a genuine overload during the run is still caught",
+   an.refresh_status().overloaded is True)
+ok("... and is not confused with a pre-run flag",
+   an.pre_start().overloaded is False)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

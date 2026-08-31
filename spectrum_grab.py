@@ -1632,7 +1632,7 @@ class App:
                 # button's whole job. Waiting on the completion bit anyway would
                 # hold the GUI - and the analyzer's front panel - until the
                 # timeout or Stop, which is what it used to do.
-                self.an.start()
+                self.an.start(log=self.log)
                 self.log(f"Average restarted and left running - {how} has no "
                          f"finish to wait for. Nothing saved.")
                 return
@@ -1642,7 +1642,7 @@ class App:
                 self.log(f"Average restarted - {how} has no finish to wait for, "
                          f"so letting it build for {dwell:g} s. Nothing saved.")
             t0 = time.perf_counter()
-            self.an.start()
+            self.an.start(log=self.log)
             state = (self.an.wait_done(self.float_of(self.timeout_s, 600.0,
                                                      "timeout"),
                                        stop=self.abort.is_set)
@@ -2088,7 +2088,7 @@ class App:
             t0 = time.perf_counter()
             if finishes:
                 self.log("  measuring...")
-                self.an.start()
+                self.an.start(log=self.log)
                 state = self.an.wait_done(
                     self.float_of(self.timeout_s, 600.0, "timeout"),
                     stop=self.abort.is_set)
@@ -2101,7 +2101,7 @@ class App:
                 dwell = self.exp_wait()
                 self.log(f"  measuring... ({how} has no finish to wait for, so "
                          f"the trace is read after {dwell:g} s)")
-                self.an.start()
+                self.an.start(log=self.log)
                 state = self.wait_out(dwell)
             measured = time.perf_counter() - t0
             if state == "stopped":
@@ -2127,6 +2127,16 @@ class App:
             status = self.an.refresh_status(log=self.log)
             over = status.overloaded
             notes["overload"] = status.describe()
+
+            # start() cleared whatever was latched before the run, so `over`
+            # belongs to the run alone. What it cleared is still worth saying:
+            # a bit set beforehand usually means the input was touched while
+            # live, and on 31 Aug it put a spurious overload on every span-11
+            # Johnson trace including the 50 ohm one.
+            before = self.an.pre_start()
+            if before is not None and before.overloaded:
+                notes["pre-run flag"] = ("overload was already latched before "
+                                         "this run - cleared, not counted")
 
             self.an.autoscale()
 

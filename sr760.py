@@ -61,6 +61,7 @@ __all__ = [
     "reads_in_db",
     "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
     "SPAN_RESETS", "OVLP_ADVANCE_S", "default_overlap",
+    "ERRS_OVERLOAD_BIT", "FFTS_OVERLOAD_BIT",
     "independent_records",
     "record_stats", "stats_notes", "averaging_fault", "overlap_fault", "readout_fault",
     "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
@@ -1070,6 +1071,7 @@ class SR760:
         self.dead = {}
         self.last_raw = {}
         self._status = None
+        self._pre_start = None
         if connect:
             self.connect(addr)
 
@@ -1263,14 +1265,37 @@ class SR760:
         last = self.inst.query_ascii_values(f"BVAL? {trace},{n_bins - 1}")[0]
         return (last - first) / (n_bins - 1)
 
-    def start(self):
+    def start(self, log=None):
         """Restart the average. Same as the [START] key.
 
-        Drops the cached status: a flag raised before a run says nothing about
-        the run, and a stale-but-plausible overload reading is worse than none.
+        Reads the status bytes first, which CLEARS them. ERRS bit 7 latches, so
+        a transient from before the run - swapping a resistor on the input, a
+        range change, reconnecting a cable - otherwise survives into the next
+        average and is reported as though the run had overloaded. Measured
+        31 Aug 2026: every span-11 Johnson trace came back flagged, 50 ohm
+        included, which cannot overload a -60 dBV range at 0.91 nV/rtHz; the
+        flagged traces agreed with the unflagged ones to 0.16 dB.
+
+        What was latched is kept in pre_start() rather than thrown away. A bit
+        set before a run is not a fault in the run, but it is worth knowing
+        about - it usually means something was touched while the input was
+        live. The cache is then dropped so the post-run read stands alone.
         """
+        self._pre_start = self.refresh_status()
+        if log is not None and self._pre_start.overloaded:
+            log("  (an overload flag was already latched before this run - "
+                "cleared, and not counted against it)")
         self.invalidate_status()
         self.put("STRT")
+
+    def pre_start(self):
+        """What was latched at the last start(), already cleared by reading it.
+
+        A flag here belongs to whatever happened before the run, not to the run.
+        Worth putting in the metadata: it is the difference between a trace that
+        saturated and a trace taken after someone touched the input.
+        """
+        return self._pre_start
 
     def wait_done(self, timeout, stop=None, poll=0.25):
         """Wait for the averaged measurement to finish.
@@ -1361,10 +1386,12 @@ class SR760:
         was about to look for. So there is exactly one read, here, and
         error_byte(), overload() and status_line() all report from the cache.
 
-        start() invalidates the cache, because a flag raised before a run says
-        nothing about the run. If nothing has refreshed since, overload()
-        refreshes rather than returning a pre-capture value - stale-but-plausible
-        is the failure this exists to stop.
+        start() calls this to consume whatever was latched before the run - the
+        read is what clears it - keeps the result in pre_start(), and then drops
+        the cache, because a flag raised before a run says nothing about the run.
+        If nothing has refreshed since, overload() refreshes rather than
+        returning a pre-capture value - stale-but-plausible is the failure this
+        exists to stop.
 
         The whole byte is read rather than a single bit: it costs the same two
         queries and keeps every other bit available for the caller who wants it.
