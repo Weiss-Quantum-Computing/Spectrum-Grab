@@ -40,6 +40,7 @@ Requires: pyvisa + a VISA runtime with GPIB (NI-488.2 on this machine), numpy.
 from __future__ import annotations
 
 import datetime
+import os
 import time
 from collections import namedtuple
 
