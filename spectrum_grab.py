@@ -85,6 +85,13 @@ PLOT_DPI = 300
 PEEK_DPI = 110                # a peek is only ever looked at in the preview box
 PREVIEW_W, PREVIEW_H = 440, 330
 
+# How often the combined plot may be redrawn while a sweep builds it up. At the
+# span a segmented measurement is actually taken on a run is a minute or more,
+# so every run gets its own redraw; this only bites on a long sweep of short
+# runs, where the drawing would otherwise cost more than the measuring - each
+# redraw carries every trace so far, so redrawing every run is quadratic.
+PROGRESS_MIN_S = 2.0
+
 # Most runs a sweep will set matrices aside for. The [case][start][span][bin]
 # pair is allocated whole before the first trace, at 6.4 kB a run, so this is
 # about 128 MB - far past any bench session, and the point is only that an
@@ -218,6 +225,9 @@ class App:
         # data rather than from the PNG: (traces, title, subtitle, ylabel,
         # yscale). None until the first grab or peek of the session.
         self.last_plot = None
+        # When the building sweep was last redrawn, so a long sweep of short
+        # runs does not spend its time drawing instead of measuring.
+        self.last_progress = 0.0
         self.zoom_win = self.zoom_fig = self.zoom_ax = None
         self.zoom_canvas = self.zoom_tb = None
         # Range hold: the input range a measurement set is pinned to, and when
@@ -683,6 +693,17 @@ class App:
         self.preview_path = None
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.shot_frame.configure(text=f"Peek at {stamp} - not saved")
+
+    def show_building(self, data, done, planned):
+        """The sweep as it stands, part way through. Same reasoning as the peek
+        about preview_path: the combined PNG is not written until the sweep
+        ends, so there is nothing for a double-click to open yet and it must not
+        fall back to whichever file happened to be shown before."""
+        if not self.render_preview(data):
+            return
+        self.preview_path = None
+        self.shot_frame.configure(
+            text=f"Sweep building - {done} of {planned} runs")
 
     # -- zoom window ------------------------------------------------------
 
@@ -1310,6 +1331,12 @@ class App:
         t_sweep = time.perf_counter()
         paused_s = 0.0
         plan = []
+        # Whether the window follows the combined plot as it builds rather than
+        # flashing through each segment on its own. Off for a single grab, which
+        # has nothing to build, and off when the combined plot is not wanted at
+        # all - that tick box is the same answer to the same question.
+        building = total > 1 and self.combined.get() and Figure is not None
+        self.last_progress = 0.0
 
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -1372,7 +1399,10 @@ class App:
                         sweep_yscale = trace_yscale(snap)
                         done.append((freqs, amps, label or self.safe_title()))
                         self.save_run(outdir, stamp, case, freqs, amps, snap,
-                                      notes)
+                                      notes, show=not building)
+                        if building:
+                            self.show_sweep_so_far(done, total, sweep_ylabel,
+                                                   sweep_yscale)
                         self.root.after(0, lambda v=snap: self.show_settings(v))
         except KeyboardInterrupt:
             ended = "stopped"
@@ -1643,9 +1673,13 @@ class App:
                 self.an.lock_panel(False)
                 self.log("  front panel unlocked")
 
-    def save_run(self, outdir, stamp, case, freqs, amps, snap, notes):
+    def save_run(self, outdir, stamp, case, freqs, amps, snap, notes,
+                 show=True):
         """CSV, plot and metadata for one measurement, under one shared base
-        name so the three files of a capture always belong together."""
+        name so the three files of a capture always belong together.
+
+        `show=False` still writes all three; it only keeps this one trace out of
+        the preview, which during a sweep belongs to the combined plot."""
         code = code_of(snap, "SPAN")
         start = float(freqs[0])
         maxfreq = round(float(np.max(freqs)))
@@ -1690,7 +1724,7 @@ class App:
             self.write_plot(base + ".png", [(freqs, amps, stem)],
                             self.plot_title(case),
                             self.plot_subtitle(snap, freqs, notes), ylabel,
-                            trace_yscale(snap))
+                            trace_yscale(snap), show=show)
 
     # -- plots ------------------------------------------------------------
 
@@ -1759,7 +1793,11 @@ class App:
         return buf.getvalue()
 
     def write_plot(self, path, traces, title, subtitle, ylabel,
-                   yscale="linear"):
+                   yscale="linear", show=True):
+        """`show=False` writes the file without taking over the preview and the
+        zoom window. That is what a sweep wants for its per-run plots: they are
+        still saved, but the window is showing the combined picture building up
+        and must not flicker through each segment on its own on the way."""
         if Figure is None:
             self.log("  (no matplotlib: skipping the plot)")
             return
@@ -1770,8 +1808,42 @@ class App:
             self.log(f"  (plot failed: {exc})")
             return
         self.log(f"  {os.path.basename(path)}")
+        if not show:
+            return
         self.remember_plot(traces, title, subtitle, ylabel, yscale)
         self.root.after(0, lambda p=path: self.show_preview(p))
+
+    def show_sweep_so_far(self, done, planned, ylabel, yscale, force=False):
+        """Draw the sweep as far as it has got, into the window only.
+
+        The combined plot used to appear once, at the end, which is a long time
+        to wait to notice that segment three is sitting on the wrong range or
+        that the overlaps are not joining. Every trace so far goes on one pair
+        of axes, in the same colours and through the same drawing code the saved
+        PNG uses, so what builds up in the window is the picture that gets
+        written at the end.
+
+        Nothing is saved here - `save_sweep` still writes the file once, when
+        the sweep is over. Returns whether it drew.
+        """
+        if Figure is None or not done:
+            return False
+        now = time.perf_counter()
+        if not force and now - self.last_progress < PROGRESS_MIN_S:
+            return False
+        self.last_progress = now
+        subtitle = SUBTITLE_SEP.join(
+            [f"{len(done)} of {planned} runs so far",
+             datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
+        try:
+            png = self.plot_png(done, self.plot_title(note="sweep building"),
+                                subtitle, ylabel, yscale)
+        except Exception as exc:
+            self.log(f"  (progress plot failed: {exc})")
+            return False
+        self.root.after(0, lambda d=png, n=len(done): self.show_building(
+            d, n, planned))
+        return True
 
     def save_sweep(self, outdir, stamp, cases, starts, spans, freqs_m, amps_m,
                    done, planned, ended="", ylabel=None, yscale=None):

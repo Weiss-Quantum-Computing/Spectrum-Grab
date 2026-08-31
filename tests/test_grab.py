@@ -691,5 +691,114 @@ ok("every run carries a countdown", log.count(" left, done ~") == 3)
 ok("the first is flagged as an estimate", "(estimated)" in log)
 root.destroy()
 
+# ------------------------------------- 9. the combined plot as it builds
+
+print("\n--- the sweep draws itself as it goes ---")
+
+
+def sweep_into(outdir, starts, combined=True, save_png=True, spans=None,
+               min_s=0.0):
+    """Run a sweep and record every time the window was handed a plot."""
+    root, app = build_app(outdir=outdir)
+    shown = []
+    app.show_building = lambda data, done, planned: shown.append(
+        ("building", done, planned))
+    app.show_preview = lambda path: shown.append(("saved", path, None))
+    app.save_csv.set(False), app.save_txt.set(False), app.save_npy.set(False)
+    app.save_png.set(save_png), app.combined.set(combined)
+    app.lock.set(False), app.pause_cases.set(False)
+    was, sg.PROGRESS_MIN_S = sg.PROGRESS_MIN_S, min_s
+    try:
+        app._grab_runs([""], starts, spans or [11])
+        root.update()
+    finally:
+        sg.PROGRESS_MIN_S = was
+    log = logged(app)
+    plot = app.last_plot
+    root.destroy()
+    return shown, log, plot
+
+
+out = os.path.join(TMP, "building")
+os.makedirs(out, exist_ok=True)
+shown, log, plot = sweep_into(out, [0.0, 1.0, 2.0, 3.0])
+
+# Was: the window showed each segment on its own and the combined plot appeared
+# once, at the end - a long time to wait to notice that segment three is on the
+# wrong range or that the overlaps are not joining.
+built = [s for s in shown if s[0] == "building"]
+ok("the window is handed the sweep after every run", len(built) == 4,
+   str([s[1] for s in built]))
+ok("... and it grows a trace at a time", [s[1] for s in built] == [1, 2, 3, 4],
+   str([s[1] for s in built]))
+ok("... each knowing how many are coming", all(s[2] == 4 for s in built))
+ok("no single-segment plot steals the window on the way",
+   not any(s[0] == "saved" for s in shown[:-1]),
+   str([s[0] for s in shown]))
+ok("the finished combined plot is what is left on screen",
+   shown[-1][0] == "saved" and shown[-1][1].endswith(".png"),
+   str(shown[-1][:2]))
+ok("the zoom window has every trace to redraw from", len(plot[0]) == 4,
+   f"{len(plot[0])} traces")
+
+# The per-run PNGs are still written; they just do not take over the preview.
+pngs = sorted(n for n in os.listdir(out) if n.endswith(".png"))
+ok("every run still wrote its own plot", len(pngs) == 5, str(len(pngs)))
+ok("... alongside the one combined plot",
+   sum("_sweep_" in n for n in pngs) == 1, str([n for n in pngs
+                                                if "_sweep_" in n]))
+
+print("\n--- and only when there is something to build ---")
+
+out = os.path.join(TMP, "single")
+os.makedirs(out, exist_ok=True)
+shown, _, _ = sweep_into(out, [None])
+ok("a single grab still shows its own plot",
+   [s[0] for s in shown] == ["saved"], str([s[0] for s in shown]))
+
+out = os.path.join(TMP, "nocombined")
+os.makedirs(out, exist_ok=True)
+shown, _, _ = sweep_into(out, [0.0, 1.0, 2.0], combined=False)
+ok("with the combined plot unticked the segments show instead",
+   all(s[0] == "saved" for s in shown) and len(shown) == 3,
+   str([s[0] for s in shown]))
+
+out = os.path.join(TMP, "nopng")
+os.makedirs(out, exist_ok=True)
+shown, _, _ = sweep_into(out, [0.0, 1.0, 2.0], save_png=False)
+ok("the building plot does not need the per-run PNGs to be saved",
+   [s[0] for s in shown[:3]] == ["building"] * 3,
+   str([s[0] for s in shown]))
+ok("... and nothing but the combined plot is written",
+   sorted(n for n in os.listdir(out) if n.endswith(".png")) == []
+   or all("_sweep_" in n for n in os.listdir(out) if n.endswith(".png")),
+   str(os.listdir(out)))
+
+print("\n--- the redraw is throttled ---")
+
+out = os.path.join(TMP, "throttle")
+os.makedirs(out, exist_ok=True)
+# Every trace drawn again for every run is quadratic, so a long sweep of short
+# runs must not spend its time drawing. These runs return instantly, so all but
+# the first fall inside the window.
+shown, _, _ = sweep_into(out, [float(i) for i in range(6)], min_s=30.0)
+built = [s for s in shown if s[0] == "building"]
+ok("a burst of fast runs does not redraw for every one", len(built) == 1,
+   f"{len(built)} redraws for 6 runs")
+ok("the finished plot is still drawn at the end",
+   shown[-1][0] == "saved", str(shown[-1][0]))
+
+root, app = build_app()
+app.last_progress = 0.0
+ok("force overrides the throttle",
+   app.show_sweep_so_far([(np.zeros(3), np.ones(3), "a")], 2, "dBV", "linear")
+   and not app.show_sweep_so_far([(np.zeros(3), np.ones(3), "a")], 2, "dBV",
+                                 "linear")
+   and app.show_sweep_so_far([(np.zeros(3), np.ones(3), "a")], 2, "dBV",
+                             "linear", force=True))
+ok("nothing to draw yet draws nothing",
+   not app.show_sweep_so_far([], 2, "dBV", "linear", force=True))
+root.destroy()
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

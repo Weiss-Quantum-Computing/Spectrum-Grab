@@ -34,11 +34,13 @@ window rather than the preview box for two reasons: a spectrum is worth looking
 at large, and the preview has to go on showing PNGs this session did not draw,
 which have no trace data behind them to redraw from.
 
-**follow new captures** is ticked by default, so a grab, a sweep step or a peek
-replaces what is on screen. Untick it to hold a zoomed view while a sweep or an
-auto-grab runs. While following, a new capture resets the view - including the
-toolbar's history, since going Home to the previous capture's limits would mean
-nothing.
+**follow new captures** is ticked by default, so a grab, a peek or a sweep step
+replaces what is on screen. During a sweep that means the combined plot as it
+builds, not each segment on its own - see [What it will
+cost](#what-it-will-cost) below. Untick it to hold a zoomed view while a sweep
+or an auto-grab runs. While following, a new capture resets the view -
+including the toolbar's history, since going Home to the previous capture's
+limits would mean nothing.
 
 The window needs matplotlib's Tk backend. A Python that has matplotlib but not
 that still saves plots and shows the preview; the button just says so.
@@ -366,6 +368,28 @@ An average with no finish of its own is priced at the **exponential wait**, not
 at NAVG, and the **measurement timeout** caps the estimate the way it caps the
 wait. If the sweep names no span and the analyzer will not say which one it is
 on, there is no estimate rather than a made-up one.
+
+### Watching it build
+
+The preview and the zoom window show the combined plot **as it builds**, a trace
+at a time, rather than flashing through each segment on its own and assembling
+the picture only at the end. Waiting until the last run to find out that segment
+three is sitting on the wrong range, or that the overlaps are not joining, is a
+long wait when a run is two minutes.
+
+It is drawn through the same code and in the same colours as the PNG written at
+the end, so nothing shifts when the sweep finishes - only the title note, from
+`(sweep building)` to `(sweep)`, and the `3 of 6 runs so far` under it. The
+frame above the preview says `Sweep building - 3 of 6 runs` while it goes, and
+double-clicking does nothing until there is a file: the combined PNG is written
+once, when the sweep ends.
+
+Each run's own CSV, plot and metadata are still written as they always were.
+The change is only which of them the window is showing. Untick **combined
+plot** and the window goes back to showing each segment as it lands, and a
+single grab is unaffected. The redraw is throttled to once every couple of
+seconds, because every trace so far is redrawn each time and a long sweep of
+short runs would otherwise spend its time drawing rather than measuring.
 
 A sweep of more than one run also writes
 
