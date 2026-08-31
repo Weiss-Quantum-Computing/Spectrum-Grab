@@ -58,6 +58,7 @@ __all__ = [
     "ALL_SETTINGS", "BY_KEY", "fmt_setting", "parse_setting", "parse_list",
     "code_of", "label_of", "trace_units", "pretty_units", "reads_in_db",
     "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
+    "SPAN_RESETS", "OVLP_ADVANCE_S", "default_overlap",
     "record_stats", "stats_notes", "averaging_fault", "readout_fault",
     "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
     "TRANSFER_BINARY_S", "TRANSFER_ASCII_S", "fmt_hms", "capture_time",
@@ -757,6 +758,32 @@ def record_time(span_code, n_bins=N_BINS):
     return n_bins / hz if hz and np.isfinite(hz) and hz > 0 else float("nan")
 
 
+# Writing SPAN silently reinstalls a span-derived OVLP - measured 31 Aug 2026
+# on s/n 41234, all three orderings. STRF does not, so a stitch is safe once
+# the span is set; the exposure is any code that moves SPAN on its own, and
+# PRESETS["protocol"] carries OVLP with no SPAN precisely so span stays
+# per-segment - which puts every span write after it.
+SPAN_RESETS = ("OVLP",)
+
+# What it reinstalls: whatever overlap holds a 16 ms record advance, clamped
+# at zero once the record is already longer than that.
+OVLP_ADVANCE_S = 0.016
+
+
+def default_overlap(span_code, n_bins=N_BINS):
+    """The overlap % a SPAN write leaves behind, without asking the analyzer.
+
+    0 at spans 17-19, then 50 / 75 / 87.5 / 93.75 / 98.44 as T_rec doubles
+    below 16 ms. The trap is that span 19's default IS zero, so the one trace
+    anyone spot-checks reads correctly while narrow spans quietly average
+    16-64x fewer independent records than NAVG claims.
+    """
+    t = record_time(span_code, n_bins)
+    if not np.isfinite(t) or t <= OVLP_ADVANCE_S:
+        return 0.0
+    return 100.0 * (1.0 - OVLP_ADVANCE_S / t)
+
+
 # Per-capture overheads, seconds. Estimates for the clock only - nothing at run
 # time is derived from them, and a sweep corrects them against its own measured
 # runs as it goes. TRANSFER_BINARY_S is the figure run_protocol.plan_set costs a
@@ -1395,12 +1422,46 @@ class SR760:
     def write_settings(self, changes, log=None):
         """Write {key: code}, each in the spelling that key answers to.
 
-        Returns the commands sent. The caller is expected to read back
-        afterwards: the analyser clamps a value it dislikes and says nothing.
+        SPAN goes first and everything in SPAN_RESETS goes last, because a
+        SPAN write silently reinstalls that span's default overlap. Passing
+        {"OVLP": "0", "SPAN": "11"} in that order used to leave 98.44 % behind,
+        and NAVG then counted records that were 98 % the same samples - an
+        error bar eight times better than the data earned, with nothing on
+        screen to say so.
+
+        Where SPAN moves and OVLP is not alongside it, the value the analyzer
+        is already holding is read first and put back after, so a span sweep
+        cannot quietly change what the averaging is worth. A value that cannot
+        be read back is not guessed at: the re-assert is skipped and said so.
+
+        Returns every command sent, re-asserts included. The caller is still
+        expected to read back - the analyzer clamps a value it dislikes and
+        says nothing.
         """
         say = log if log is not None else (lambda _msg: None)
+        wanted = dict(changes)
+        after = {}
+        if "SPAN" in wanted:
+            for key in SPAN_RESETS:
+                if key in wanted:
+                    after[key] = wanted.pop(key)
+                    continue
+                held = self.read_settings(key).get(key)
+                if held is None:
+                    say(f"  ({key} could not be read back, so the SPAN write "
+                        f"leaves the span default in place - check it)")
+                    continue
+                after[key] = str(held).strip()
+                say(f"  (holding {key}={after[key]} across the SPAN write)")
+
+        ordered = {}
+        if "SPAN" in wanted:
+            ordered["SPAN"] = wanted.pop("SPAN")
+        ordered.update(wanted)
+        ordered.update(after)
+
         sent = []
-        for key, value in changes.items():
+        for key, value in ordered.items():
             cmd = self.command(key, value)
             self.put(cmd)
             sent.append(cmd)

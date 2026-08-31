@@ -1773,7 +1773,16 @@ class App:
                         self.settle_due.set()
                     for isp, span in enumerate(spans):
                         if span is not None:
-                            self.an.put(self.an.command("SPAN", span))
+                            # Through write_settings rather than put(command()):
+                            # a SPAN write silently reinstalls that span's
+                            # default overlap, and this loop is what produced
+                            # the 30 Aug sweep where NAVG 400 bought 6
+                            # independent records at span 11. write_settings
+                            # puts the held OVLP back afterwards, and still
+                            # writes through command(), so the qform spelling
+                            # above is honoured either way.
+                            self.an.write_settings({"SPAN": span},
+                                                   log=self.log)
                             self.settle_due.set()
                         if self.abort.is_set():
                             raise KeyboardInterrupt

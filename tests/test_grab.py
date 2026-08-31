@@ -16,6 +16,7 @@ clean-looking overload line. The analyzer never complains, so the test has to.
 
     python tests/test_grab.py
 """
+import datetime
 import glob
 import json
 import os
@@ -85,6 +86,7 @@ class FakeAn:
         self.qform = {}
         self.sent = []
         self._status = None
+        self.last_raw = {}
 
     def command(self, key, value):
         return S.BY_KEY[key].writes[self.qform.get(key, 0)].format(v=value)
@@ -100,6 +102,12 @@ class FakeAn:
 
     def recover(self):
         pass
+
+    # The real settings-write path, so the SPAN/OVLP ordering the sweep
+    # depends on is exercised as shipped rather than reimplemented here.
+    # read_settings is FakeAn's own, below - it answers from the snapshot.
+    write_settings = S.SR760.write_settings
+    _remember = S.SR760._remember
 
     def close(self):
         self.inst = None
@@ -885,6 +893,11 @@ def run_sweep(outdir, starts, cases=None, keep=False, spans=None):
     return sorted(os.listdir(outdir)), log
 
 
+# The sweep stamps its own filenames with today's date, so the expected
+# names have to be built the same way - hardcoding one passes only on the
+# day it was written.
+TODAY = datetime.datetime.now().strftime("%Y%m%d")
+
 out = os.path.join(TMP, "onefileset")
 os.makedirs(out, exist_ok=True)
 files, log = run_sweep(out, [0.0, 1.0, 2.0, 3.0])
@@ -892,7 +905,7 @@ files, log = run_sweep(out, [0.0, 1.0, 2.0, 3.0])
 # combined set on top, all of it the same four traces written twice.
 ok("four segments leave one set of files, not four", len(files) == 6,
    str(files))
-ok("... the traces, as one CSV", files.count("sr760_sweep_20260830.csv") == 1)
+ok("... the traces, as one CSV", files.count(f"sr760_sweep_{TODAY}.csv") == 1)
 ok("... the matrices and their axes",
    sum(n.endswith((".npy", "_axes.json")) for n in files) == 3, str(files))
 ok("... one plot", sum(n.endswith(".png") for n in files) == 1)
@@ -902,7 +915,7 @@ ok("no per-segment file survives",
 
 print("\n--- but the combined CSV is the whole sweep ---")
 
-csv = os.path.join(out, "sr760_sweep_20260830.csv")
+csv = os.path.join(out, f"sr760_sweep_{TODAY}.csv")
 rows = np.loadtxt(csv, delimiter=",", skiprows=1)
 ok("every point of every segment is in it", rows.shape == (4 * sg.N_BINS, 3),
    str(rows.shape))
@@ -920,7 +933,7 @@ ok("the compare loader reads it", len(f) == 4 * sg.N_BINS
 
 print("\n--- and the metadata describes every segment ---")
 
-meta = open(os.path.join(out, "sr760_sweep_20260830.txt"),
+meta = open(os.path.join(out, f"sr760_sweep_{TODAY}.txt"),
             encoding="utf-8").read()
 ok("the sweep is described", "1 case(s) x 4 start freq(s)" in meta)
 ok("the runs are counted", "runs completed       : 4" in meta, )
@@ -1323,6 +1336,69 @@ ok("... and it still steps evenly the whole way",
 ok("... and the box it filled is one the sweep will accept",
    len(S.parse_list(text)) == S.MAX_LIST_ITEMS)
 root.destroy()
+
+# ---------------------------------------------------------------------------
+# SPAN silently reinstalls the span's default OVLP (measured 31 Aug 2026 on
+# s/n 41234). Every one of these used to pass a 98.44 % overlap off as the
+# OVLP 0 that was asked for, and record_stats then quoted an error bar eight
+# times better than the samples earned.
+# ---------------------------------------------------------------------------
+
+class OrderAn(FakeAn):
+    """FakeAn holding a known OVLP, so what is under test is the shipped
+    write_settings rather than a reimplementation of it. An empty snapshot is
+    the analyzer that cannot answer OVLP? at all."""
+
+    def __init__(self, held="98.44", readable=True):
+        FakeAn.__init__(self, {"OVLP": held} if readable else {})
+
+
+# SPANS stores the analyzer's own rounded display labels - 1560 Hz where the
+# instrument is really 1562.5 - so codes 11-13 come out 0.16 % off the exact
+# binary spans. That is immaterial everywhere record_time is used, but it means
+# these cannot be asserted to the last digit.
+MEASURED = {19: 0.0, 17: 0.0, 16: 50.0, 15: 75.0, 13: 93.75, 11: 98.44}
+ok("default_overlap reproduces every measured span default",
+   all(abs(S.default_overlap(c) - v) < 0.05 for c, v in MEASURED.items()),
+   str({c: round(S.default_overlap(c), 2) for c in MEASURED}))
+
+ok("... and clamps to zero once the record is already past 16 ms",
+   S.default_overlap(19) == 0.0 and S.default_overlap(17) == 0.0
+   and S.default_overlap(16) > 0,
+   "span 19's default IS zero - which is why the 30 Aug set looked healthy")
+
+an = OrderAn()
+sent = an.write_settings({"OVLP": "0", "SPAN": "11"})
+ok("OVLP asked for before SPAN is still sent after it",
+   sent.index("SPAN 11") < sent.index("OVLP 0"), str(sent))
+ok("... and OVLP is sent exactly once",
+   sum(c.startswith("OVLP") for c in sent) == 1, str(sent))
+
+an = OrderAn(held="98.44")
+sent = an.write_settings({"SPAN": "11"})
+ok("a SPAN-only write puts the held OVLP back after the span",
+   sent == ["SPAN 11", "OVLP 98.44"], str(sent))
+
+an = OrderAn(held="0.00")
+sent = an.write_settings({"SPAN": "11", "NAVG": "100"})
+ok("... and a zero it was holding is re-asserted too, not assumed",
+   sent[0] == "SPAN 11" and sent[-1] == "OVLP 0.00", str(sent))
+
+an = OrderAn()
+sent = an.write_settings({"STRF": "10000"})
+ok("STRF does not trigger a re-assert - the stitch is safe once span is set",
+   sent == ["STRF 10000"], str(sent))
+
+an = OrderAn(readable=False)
+notes = []
+sent = an.write_settings({"SPAN": "11"}, log=notes.append)
+ok("an unreadable OVLP is skipped rather than guessed at",
+   sent == ["SPAN 11"], str(sent))
+ok("... and the log says the span default was left in place",
+   any("could not be read back" in n for n in notes), " | ".join(notes))
+
+ok("the protocol preset still carries OVLP with no SPAN of its own",
+   "OVLP" in S.PRESETS["protocol"] and "SPAN" not in S.PRESETS["protocol"])
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")
