@@ -53,6 +53,7 @@ __all__ = [
     "OP_TIMEOUT_MS", "SETTINGS_TIMEOUT_MS", "READY_PROBE", "READY_POLL_MS",
     "READY_TIMEOUT_S", "DEFAULT_EXP_WAIT_S", "DEFAULT_SETTLE_RECS",
     "SETTLE_KEYS", "SPACE_OWNERS", "BAD_NAME_CHARS", "SPANS", "SPAN_CHOICES",
+    "MAX_FREQ",
     "MAX_LIST_ITEMS", "Setting", "spellings", "num", "enum", "SETTING_GROUPS",
     "ALL_SETTINGS", "BY_KEY", "fmt_setting", "parse_setting", "parse_list",
     "code_of", "label_of", "trace_units", "pretty_units", "reads_in_db",
@@ -121,6 +122,13 @@ SPANS = [
     ("50 kHz", 50000.0), ("100 kHz", 100000.0),
 ]
 SPAN_CHOICES = tuple(f"{i} - {label}" for i, (label, _) in enumerate(SPANS))
+
+# The top of the analyzer's band. The widest span starts at 0 and covers all of
+# it, so nothing can be measured above this and a narrower span cannot begin any
+# higher than MAX_FREQ minus its own width - the analyzer clamps a start
+# frequency that would run off the end, silently, and two starts past the limit
+# both land on the same place and measure the same band twice.
+MAX_FREQ = max(hz for _label, hz in SPANS)
 
 # Settings the panel shows and can push back. `key` doubles as the dict key
 # everywhere.

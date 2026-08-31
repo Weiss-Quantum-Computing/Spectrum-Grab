@@ -1029,5 +1029,110 @@ ok("... converted onto the capture's own scale",
    ylabel == trace_units(GOOD), ylabel)
 root.destroy()
 
+# --------------------------------------- 11. the stitch stays in the band
+
+print("\n--- filling the start frequencies ---")
+
+ok("the top of the band is the widest span", S.MAX_FREQ == 100000.0,
+   f"{S.MAX_FREQ:g} Hz")
+
+root, app = build_app()
+
+
+def stitch(spacing, stop, overlap=10):
+    clear_log(app)
+    app.fill_stitch(spacing, stop, overlap, "test")
+    text = app.starts_txt.get()
+    return [float(x) for x in text.split(",") if x.strip()], logged(app), text
+
+
+# The two real cases. Span 13 is the 20260826 stitch and span 11 the 259
+# segment one; both asked for start frequencies the analyzer could not honour.
+for spacing, span_name in ((3.9058, "span 13"), (0.96680, "span 11")):
+    span = sg.N_BINS * spacing
+    starts, log, _ = stitch(spacing, 100000.0)
+    over = [s for s in starts if s + span > S.MAX_FREQ + 1e-6]
+    # Was: the last start ran past the top and the analyzer clamped it without
+    # saying so - two starts past the limit would both land on the same place
+    # and measure the same band twice.
+    ok(f"{span_name}: no segment starts where its span runs off the top",
+       not over, f"{len(over)} of {len(starts)} would")
+    ok(f"{span_name}: the last start is the highest one that fits",
+       abs(starts[-1] - (S.MAX_FREQ - span)) < 1e-6,
+       f"{starts[-1]:.4f} vs {S.MAX_FREQ - span:.4f}")
+    top = starts[-1] + (sg.N_BINS - 1) * spacing
+    ok(f"{span_name}: the band is still measured to the top",
+       top > S.MAX_FREQ - spacing - 1e-6, f"reaches {top:.2f} Hz")
+    ok(f"{span_name}: and it says the last one was pulled down",
+       "would have run past" in log and "instead of" in log)
+
+# 98437.68 Hz is where the analyzer had been clamping the 20260826 stitch to,
+# which is why its top measured frequency came out at 99996 Hz.
+starts, _, _ = stitch(3.9058, 100000.0)
+ok("the pulled-down start is where the analyzer was clamping to anyway",
+   abs(starts[-1] - 98437.68) < 0.01, f"{starts[-1]:.2f} Hz")
+ok("... and reaches the 99996 Hz the saved data tops out at",
+   abs(starts[-1] + 399 * 3.9058 - 99996) < 1.0,
+   f"{starts[-1] + 399 * 3.9058:.1f} Hz")
+
+# The ordinary case must not change: a stitch that fits in the band steps
+# evenly the whole way and shares exactly the overlap asked for.
+starts, log, _ = stitch(0.96680, 20000.0)
+steps = {round((starts[i + 1] - starts[i]) / 0.96680)
+         for i in range(len(starts) - 1)}
+ok("a stitch inside the band steps evenly all the way", steps == {390},
+   str(sorted(steps)))
+ok("... and nothing is said about pulling anything down",
+   "would have run past" not in log)
+ok("... and it still overshoots the stop, so the stop is covered",
+   starts[-1] + 399 * 0.96680 > 20000.0)
+
+starts, log, _ = stitch(3.9058, 150000.0)
+ok("a stop above the band is capped", "100000 Hz is the top" in log,
+   " ".join(log.split())[:74])
+ok("... and no start goes past it either",
+   all(s + 400 * 3.9058 <= S.MAX_FREQ + 1e-6 for s in starts))
+
+# The overlap the last pair actually ends up sharing is reported, not left to
+# be worked out from the numbers.
+starts, log, _ = stitch(3.9058, 100000.0)
+shared = sg.N_BINS - round((starts[-1] - starts[-2]) / 3.9058)
+ok("the extra overlap is named", f"shares {shared} points" in log,
+   f"shares {shared} points")
+ok("... and it is more than was asked for", shared > 10, str(shared))
+
+# A span wider than the band cannot be stitched at all.
+_, log, text = stitch(300.0, 100000.0)          # 400 x 300 Hz = 120 kHz
+ok("a span wider than the band is refused",
+   "more than the analyzer" in log, " ".join(log.split())[:70])
+
+# Whatever it writes has to survive being read back - fill_stitch and
+# parse_list share MAX_LIST_ITEMS so the box it fills cannot be one the sweep
+# then refuses.
+starts, _, text = stitch(0.19073, 100000.0)     # 1345 segments, just inside
+ok("a long stitch that fits is filled in full",
+   len(starts) <= S.MAX_LIST_ITEMS, str(len(starts)))
+ok("... and what it wrote parses back to what it meant",
+   len(S.parse_list(text)) == len(starts), str(len(S.parse_list(text))))
+
+# A span narrow enough to need more segments than the sweep will take. The
+# last start must NOT be pulled to the top of the band here: the loop stopped
+# because the list is full, not because the band ran out, so moving it would
+# leap over everything in between and call the gap an overlap - and would
+# leave MAX_LIST_ITEMS + 1 entries, which parse_list then refuses.
+starts, log, text = stitch(0.05, 100000.0)      # 5128 needed, 2000 allowed
+ok("a stitch too long for one sweep stops at the limit",
+   len(starts) == S.MAX_LIST_ITEMS, str(len(starts)))
+ok("... and says the top of the band is not covered",
+   "nothing above" in log, " ".join(log.split())[-96:])
+ok("... without pulling the last start to the top",
+   starts[-1] < S.MAX_FREQ / 2, f"{starts[-1]:.1f} Hz")
+ok("... and it still steps evenly the whole way",
+   {round((starts[i + 1] - starts[i]) / 0.05)
+    for i in range(len(starts) - 1)} == {390})
+ok("... and the box it filled is one the sweep will accept",
+   len(S.parse_list(text)) == S.MAX_LIST_ITEMS)
+root.destroy()
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

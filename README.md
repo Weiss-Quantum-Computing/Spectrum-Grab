@@ -490,6 +490,35 @@ declines while the panel has a span change you have not applied yet - it would
 otherwise measure the old span. Offline it falls back to the span table and says
 in the log that the step is an estimate.
 
+### The top of the band
+
+Nothing is offered a start frequency whose span would run off the end of the
+analyzer's 100 kHz band. The SR760 clamps a start it cannot honour and says
+nothing about having done so, so a stitch that walked past the top used to hand
+it start frequencies it quietly moved — and two starts past the limit both land
+in the same place and measure the same band twice.
+
+Where the band runs out before your stop frequency does, the last start is
+**pulled down** to the highest one that fits rather than dropped:
+
+```
+66 segments of 400 points at 3.9058 Hz per point (measured on the analyzer),
+stepping 390 points (1523.26 Hz) to 99996.1 Hz - neighbours share 10 point(s).
+  (the last segment starts at 98437.68 Hz rather than 99012.03 Hz, which would
+  have run past 100000 Hz. The band is still covered to the top; that segment
+  shares 157 points with the one before it instead of 10.)
+```
+
+So the top of the band is still measured, and the cost is only that the last two
+segments repeat more frequency than the rest — which is the same kind of overlap
+the stitch is built on. A stop frequency above 100 kHz is capped, and said. A
+span wider than the band is refused outright.
+
+One case is deliberately *not* pulled down: a stitch that needs more segments
+than a sweep will take (`MAX_LIST_ITEMS`, 2000) stops at the limit and says the
+top is not covered. Moving its last start to 100 kHz would leap over everything
+in between and call the gap an overlap.
+
 ## Acquisition
 
 - **fast binary transfer (SPEB?)** - pulls the whole trace in one read instead

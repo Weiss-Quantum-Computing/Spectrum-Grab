@@ -41,13 +41,13 @@ import numpy as np
 # the panel to run.
 from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    CONNECT_TIMEOUT_MS, DEFAULT_ADDRESS, DEFAULT_EXP_WAIT_S,
-                   DEFAULT_SETTLE_RECS, N_BINS, PRESETS, READY_TIMEOUT_S,
-                   SETTING_GROUPS, SETTLE_KEYS, SPACE_OWNERS, SPAN_CHOICES,
-                   SPANS, TRACE, TRANSFER_ASCII_S, TRANSFER_BINARY_S,
-                   averaging_fault, binary_refusal, binary_valid, capture_time,
-                   canonical_units, code_of, convert_amplitude, fmt_hms,
-                   fmt_setting, hold_notes, label_of, metadata_text,
-                   parse_list, parse_setting,
+                   DEFAULT_SETTLE_RECS, MAX_FREQ, MAX_LIST_ITEMS, N_BINS,
+                   PRESETS, READY_TIMEOUT_S, SETTING_GROUPS, SETTLE_KEYS,
+                   SPACE_OWNERS, SPAN_CHOICES, SPANS, TRACE, TRANSFER_ASCII_S,
+                   TRANSFER_BINARY_S, averaging_fault, binary_refusal,
+                   binary_valid, canonical_units, capture_time, code_of,
+                   convert_amplitude, fmt_hms, fmt_setting, hold_notes,
+                   label_of, metadata_text, parse_list, parse_setting,
                    pretty_units, read_csv, readout_fault, reads_in_db,
                    record_stats, record_time, safe_name, span_hz, stats_notes,
                    trace_units, trace_yscale, unique_base, unit_parts,
@@ -1090,20 +1090,81 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def fill_stitch(self, spacing, stop, overlap, source):
-        """Main thread. Lay the segments out at the given point spacing."""
+        """Main thread. Lay the segments out at the given point spacing.
+
+        No segment may start so high that its span runs off the top of the
+        band. The analyzer clamps a start frequency it cannot honour and says
+        nothing, so a stitch that walked past 100 kHz used to hand it starts it
+        quietly moved - two of them landing on the same place and measuring the
+        same band twice. The 259-segment sweep of 2026-08-26 asked for a last
+        start of 99773 Hz at a span 387 Hz wide; the analyzer put it at 99613
+        and the run cost the same either way.
+
+        Where the band runs out before the stop frequency does, the last start
+        is pulled down to the highest one the analyzer will take rather than
+        dropped. The top of the band still gets measured; the last two segments
+        simply share more points than the overlap asked for, which is the same
+        kind of overlap the stitch is built on and costs nothing but a little
+        repeated frequency.
+        """
         step = (N_BINS - overlap) * spacing
         if step <= 0 or not np.isfinite(step):
             self.log(f"A point spacing of {spacing:g} Hz gives no usable step.")
             return
-        starts, f = [], 0.0
-        while f <= stop and len(starts) < 2000:
+        span = N_BINS * spacing              # what one segment covers
+        highest = MAX_FREQ - span            # a segment here ends on the top
+        if highest < 0:
+            self.log(f"One segment is {span:.6g} Hz wide, more than the "
+                     f"analyzer's {MAX_FREQ:g} Hz band - nothing to stitch.")
+            return
+        asked, stop = stop, min(stop, MAX_FREQ)
+
+        starts, f, too_many = [], 0.0, False
+        while f <= stop + 1e-9:
+            if f > highest + 1e-9:
+                break
+            if len(starts) >= MAX_LIST_ITEMS:
+                too_many = True
+                break
             starts.append(f)
             f += step
+        if not starts:
+            self.log(f"A stop frequency of {asked:g} Hz leaves nothing to "
+                     f"measure.")
+            return
+
+        # The last segment measures up to its start plus (bins - 1) spacings.
+        # Only pulled down when it was the band that ran out: stopping because
+        # the list is full is a different thing, and moving the last start to
+        # the top of the band would then leap over everything in between and
+        # call the gap an overlap.
+        shared = 0
+        if (not too_many
+                and starts[-1] + (N_BINS - 1) * spacing < stop - 1e-6
+                and starts[-1] < highest - 1e-9):
+            starts.append(highest)
+            shared = N_BINS - int(round((starts[-1] - starts[-2]) / spacing))
+
         self.starts_txt.set(", ".join(f"{v:.10g}" for v in starts))
+        top = starts[-1] + (N_BINS - 1) * spacing
         self.log(f"{len(starts)} segments of {N_BINS} points at "
                  f"{spacing:.6g} Hz per point ({source}), stepping "
-                 f"{N_BINS - overlap} points ({step:.6g} Hz) to {stop:g} Hz - "
+                 f"{N_BINS - overlap} points ({step:.6g} Hz) to {top:.6g} Hz - "
                  f"neighbours share {overlap} point(s).")
+        if asked > MAX_FREQ:
+            self.log(f"  ({asked:g} Hz asked for; {MAX_FREQ:g} Hz is the top of "
+                     f"the analyzer's band)")
+        if too_many:
+            self.log(f"  (stopped at {MAX_LIST_ITEMS} segments, which is as "
+                     f"long a sweep as this will take - nothing above "
+                     f"{top:.6g} Hz is covered. A wider span would reach the "
+                     f"top in fewer runs.)")
+        if shared:
+            self.log(f"  (the last segment starts at {starts[-1]:.10g} Hz "
+                     f"rather than {starts[-2] + step:.10g} Hz, which would "
+                     f"have run past {MAX_FREQ:g} Hz. The band is still covered "
+                     f"to the top; that segment shares {shared} points with the "
+                     f"one before it instead of {overlap}.)")
 
     def do_action(self, name, fn, wait_ready=False):
         """One-shot instrument command from a button, then re-read the panel.
