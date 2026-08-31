@@ -59,7 +59,8 @@ __all__ = [
     "ALL_SETTINGS", "BY_KEY", "fmt_setting", "parse_setting", "parse_list",
     "code_of", "value_of", "label_of", "trace_units", "pretty_units",
     "reads_in_db",
-    "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
+    "trace_yscale", "binary_valid", "binary_refusal", "floor_fault",
+    "span_hz", "record_time",
     "SPAN_RESETS", "OVLP_ADVANCE_S", "default_overlap",
     "ERRS_OVERLOAD_BIT", "FFTS_OVERLOAD_BIT",
     "independent_records",
@@ -369,6 +370,36 @@ def overlap_fault(snap, span_code=None):
                       f"write may have installed it in place of the value "
                       f"that was asked for")
     return msg
+
+
+def floor_fault(amps, min_unique=8):
+    """Why this trace is the display floor rather than a measurement, or "".
+
+    A trace pinned far coarser than its signal does not come back small - it
+    comes back CONSTANT, every bin sitting on the bottom of the analyzer's
+    display range, and binary_valid() reports True the whole time. Measured
+    31 Aug 2026: +10 dBV at span 13 returned 1.762 uV/rtHz in all 400 bins, and
+    +8 dBV returned 1.4 uV/rtHz in all 400. Both look like a plausible noise
+    floor and neither is one.
+
+    The floor scales with ENBW, so it bites hardest at narrow spans - at span
+    18 the same range sits well clear of it, which is why the A2 range map is
+    unaffected. Counting distinct values catches it whatever the cause: real
+    noise across 400 bins produces hundreds of distinct readings, and anything
+    in single figures means the trace has been quantised flat.
+    """
+    a = np.asarray(amps, dtype=float)
+    if a.size == 0:
+        return ""
+    uniq = np.unique(a).size
+    if uniq >= int(min_unique):
+        return ""
+    if uniq == 1:
+        return (f"every bin reads {a.flat[0]:.4g} - this is the display floor, "
+                f"not a measurement; the range is far coarser than the signal")
+    return (f"only {uniq} distinct values across {a.size} bins - the trace is "
+            f"quantised flat against the display floor, so the range is far "
+            f"coarser than the signal")
 
 
 def readout_fault(snap):

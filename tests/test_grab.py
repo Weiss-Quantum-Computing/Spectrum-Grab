@@ -183,12 +183,25 @@ class FakeAn:
         width = S.span_hz(S.code_of(self.snap, "SPAN", 11))
         return np.linspace(start, start + width, n_bins)
 
+    # Scattered, not flat. A constant trace is exactly what floor_fault
+    # exists to reject, so a fixture returning one would make every capture
+    # test assert on a SUSPECT verdict - and would have hidden the guard
+    # instead of exercising it. Deterministic, so the checks stay repeatable.
+    def _amps(self, n_bins, in_db):
+        rng = np.random.default_rng(4063)
+        lin = 1e-6 * np.exp(rng.normal(0.0, 0.35, n_bins))
+        return 20 * np.log10(lin) if in_db else lin
+
     def trace_binary(self, trace, n_bins, in_db=True):
-        return (self.band(n_bins),
-                np.full(n_bins, -120.0 if in_db else 1e-6))
+        return self.band(n_bins), self._amps(n_bins, in_db)
 
     def trace_ascii(self, trace, n_bins, progress=None):
-        return self.band(n_bins), np.full(n_bins, 1e-6)
+        return self.band(n_bins), self._amps(n_bins, False)
+
+    def flat_trace(self, n_bins=None):
+        """The display-floor failure: every bin identical."""
+        n = n_bins or S.N_BINS
+        return self.band(n), np.full(n, 1.762e-6)
 
     def read_settings(self, *keys):
         return {k: self.snap[k] for k in keys if k in self.snap}
@@ -1988,6 +2001,27 @@ ok("a genuine overload during the run is still caught",
    an.refresh_status().overloaded is True)
 ok("... and is not confused with a pre-run flag",
    an.pre_start().overloaded is False)
+
+# ---------------------------------------------------------------------------
+# A trace pinned far coarser than its signal comes back CONSTANT, not small -
+# every bin on the display floor, with binary_valid() reporting True. Measured
+# 31 Aug 2026: +10 dBV at span 13 returned 1.762 uV/rtHz in all 400 bins.
+# ---------------------------------------------------------------------------
+
+ok("a flat trace is caught as the display floor",
+   "display floor" in S.floor_fault(np.full(400, 1.762e-6)),
+   S.floor_fault(np.full(400, 1.762e-6)))
+ok("... and says what every bin read",
+   "1.762e-06" in S.floor_fault(np.full(400, 1.762e-6)))
+ok("a trace quantised to a handful of levels is caught too",
+   "quantised flat" in S.floor_fault(np.repeat([1e-6, 2e-6, 3e-6], 133)))
+ok("real scatter is not flagged",
+   S.floor_fault(FakeAn(GOOD)._amps(400, False)) == "")
+ok("an empty trace is not flagged as a floor",
+   S.floor_fault(np.array([])) == "")
+ok("the threshold is where it says it is",
+   S.floor_fault(np.arange(400.0), min_unique=8) == ""
+   and S.floor_fault(np.repeat(np.arange(4.0), 100), min_unique=8) != "")
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

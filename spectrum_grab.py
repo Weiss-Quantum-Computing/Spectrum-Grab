@@ -45,6 +45,7 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    READY_TIMEOUT_S, SETTING_GROUPS, SETTLE_KEYS,
                    SPACE_OWNERS, SPAN_CHOICES, SPANS, TRACE, TRANSFER_ASCII_S,
                    TRANSFER_BINARY_S, averaging_fault, binary_refusal,
+                   floor_fault,
                    binary_valid, canonical_units, capture_time, code_of,
                    convert_amplitude, default_overlap, fmt_hms, fmt_setting,
                    hold_notes,
@@ -2214,6 +2215,16 @@ class App:
                     TRACE, N_BINS,
                     progress=lambda i, n: self.log(f"    {i}/{n} bins"))
             transferred = time.perf_counter() - t0
+
+            # Only checkable once the trace is in hand, so the verdict built
+            # above has to be reopened. A flat trace is the one failure that
+            # looks entirely healthy from the settings alone.
+            flat = floor_fault(amps)
+            if flat:
+                faults.append(flat)
+                notes["trace quality"] = "SUSPECT: " + "; ".join(faults)
+                self.log(f"  *** {notes['trace quality']} ***")
+
             notes["transfer"] = ("binary dump (SPEB?)" if binary
                                  else "bin by bin (BVAL?/SPEC?)")
             notes["transfer time (s)"] = f"{transferred:.3f}"
