@@ -53,12 +53,12 @@ __all__ = [
     "OP_TIMEOUT_MS", "SETTINGS_TIMEOUT_MS", "READY_PROBE", "READY_POLL_MS",
     "READY_TIMEOUT_S", "DEFAULT_EXP_WAIT_S", "DEFAULT_SETTLE_RECS",
     "SETTLE_KEYS", "SPACE_OWNERS", "BAD_NAME_CHARS", "SPANS", "SPAN_CHOICES",
-    "Setting", "spellings", "num", "enum", "SETTING_GROUPS", "ALL_SETTINGS",
-    "BY_KEY", "fmt_setting", "parse_setting", "parse_list", "code_of",
-    "label_of", "trace_units", "pretty_units", "reads_in_db", "trace_yscale",
-    "binary_valid", "span_hz", "record_time", "record_stats", "stats_notes",
-    "averaging_fault", "hold_notes", "safe_name", "unique_base", "write_csv",
-    "metadata_text",
+    "MAX_LIST_ITEMS", "Setting", "spellings", "num", "enum", "SETTING_GROUPS",
+    "ALL_SETTINGS", "BY_KEY", "fmt_setting", "parse_setting", "parse_list",
+    "code_of", "label_of", "trace_units", "pretty_units", "reads_in_db",
+    "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
+    "record_stats", "stats_notes", "averaging_fault", "readout_fault",
+    "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
 ]
 
 DEFAULT_ADDRESS = "GPIB0::10::INSTR"
@@ -284,7 +284,14 @@ def averaging_fault(snap):
 
     Checked on the snapshot taken with the trace, so a knob turned mid-set is
     caught on the trace it affected rather than at the end of the run.
+
+    An AVGO that could not be read back is a fault in its own right. It is what
+    record_stats has to be told to work out an error bar at all, and guessing it
+    either invents an average that was never taken or throws away one that was.
     """
+    if snap.get("AVGO") is None:
+        return ("the averaging setting could not be read back, so what this "
+                "trace is an average of cannot be stated")
     if code_of(snap, "AVGO", 0) != 1:
         return ""                     # averaging off is a separate question
     kind = label_of(snap, "AVGT")
@@ -296,6 +303,34 @@ def averaging_fault(snap):
         return (f"{mode.lower()} averaging: the trace is a running average of "
                 f"no definite depth, so the statistics cannot be stated")
     return ""
+
+
+def readout_fault(snap):
+    """Why the scale this trace is labelled on is an assumption, or "".
+
+    trace_units(), reads_in_db() and trace_yscale() all have to answer with
+    something, so they fall back to dBV and LogMag when the snapshot has no
+    UNIT0 or DISP0 in it - which is exactly what read_all_settings leaves
+    behind once a setting has failed to answer twice and been dropped for the
+    session.
+
+    A guess about UNIT0 is a 160 dB guess. It is the one thing that decides
+    whether trace_binary rebases bin 0 as a dB offset or through 20 log10, and
+    the wrong way round pins bin 0 near zero and drags the whole trace with it -
+    a floor the analyzer draws at 10 nV/sqrtHz coming out of the app at about
+    0 dBVpk/sqrtHz. binary_valid() refuses the dump outright when either is
+    missing, so the number is safe; this is about the label on it, which is
+    still a fallback rather than a reading and has to say so.
+
+    Unverified and verified are different claims - the same standard hold_notes
+    holds the input range to.
+    """
+    missing = [BY_KEY[k].label for k in ("UNIT0", "DISP0")
+               if k in BY_KEY and snap.get(k) is None]
+    if not missing:
+        return ""
+    return (f"{' and '.join(missing)} could not be read back, so this trace is "
+            f"labelled {trace_units(snap)} on a fallback, not on a reading")
 
 
 def hold_notes(pinned_range, snap, set_name="", armed_at=""):
@@ -361,15 +396,35 @@ class Status(namedtuple("Status", "errs ffts at")):
         """Whether the analyser answered at all."""
         return self.errs is not None or self.ffts is not None
 
+    @property
+    def complete(self) -> bool:
+        """Whether BOTH bytes answered, which is what it takes to rule an
+        overload out. Either byte alone can only ever rule one in: an ERRS that
+        came back clear says nothing about the FFT overload in FFTS, and a
+        half-read status reported as "no" is the clean-looking answer this
+        whole class exists to stop."""
+        return self.errs is not None and self.ffts is not None
+
+    @staticmethod
+    def _bit_state(value):
+        """A bit that was never read is not a bit that was clear."""
+        return "unread" if value is None else ("set" if value else "clear")
+
     def describe(self) -> str:
         if not self.read:
             return "unread"
-        if not self.overloaded:
-            return "no"
-        return (f"YES - ERRS bit {ERRS_OVERLOAD_BIT} "
-                f"{'set' if self.errs_bit(ERRS_OVERLOAD_BIT) else 'clear'}, "
-                f"FFTS bit {FFTS_OVERLOAD_BIT} "
-                f"{'set' if self.ffts_bit(FFTS_OVERLOAD_BIT) else 'clear'}")
+        if self.overloaded:
+            return (f"YES - ERRS bit {ERRS_OVERLOAD_BIT} "
+                    f"{self._bit_state(self.errs_bit(ERRS_OVERLOAD_BIT))}, "
+                    f"FFTS bit {FFTS_OVERLOAD_BIT} "
+                    f"{self._bit_state(self.ffts_bit(FFTS_OVERLOAD_BIT))}")
+        missing = [name for name, value in (("ERRS", self.errs),
+                                            ("FFTS", self.ffts))
+                   if value is None]
+        if missing:
+            return (f"UNVERIFIED - {' and '.join(missing)} did not answer, so "
+                    f"an overload cannot be ruled out")
+        return "no"
 
 
 # ---------------------------------------------------------------------------
@@ -405,9 +460,14 @@ def fmt_setting(s, raw):
     raw = (raw or "").strip()
     if s.kind == "enum":
         try:
-            return s.choices[int(float(raw))]
-        except (ValueError, IndexError):
+            code = int(float(raw))
+        except ValueError:
             return raw
+        # Bounds-checked rather than caught, because a negative index does not
+        # raise - it wraps, and "-1" would come back as the last choice, which
+        # is the plausible-looking wrong answer this whole module is built to
+        # avoid. label_of() has always checked; this is the same check.
+        return s.choices[code] if 0 <= code < len(s.choices) else raw
     try:
         return f"{float(raw):g}"
     except ValueError:
@@ -423,9 +483,18 @@ def parse_setting(s, shown):
     return f"{float(shown):g}"
 
 
+# The longest sweep axis either form of `parse_list` will hand back. A list is
+# not just a list here: the panel allocates a [case][start][span][bin] matrix
+# before the first trace, so 2000 start frequencies against 20 spans is already
+# most of a gigabyte of NaN. The range form has always been capped; the comma
+# form was not, and a pasted column of numbers went straight through it.
+MAX_LIST_ITEMS = 2000
+
+
 def parse_list(text):
     """Comma or space separated numbers, or 'start:stop:step'. An empty box
-    gives [], which callers read as 'leave the instrument where it is'."""
+    gives [], which callers read as 'leave the instrument where it is'. Either
+    form is capped at MAX_LIST_ITEMS."""
     text = text.strip()
     if not text:
         return []
@@ -440,10 +509,15 @@ def parse_list(text):
         while (value <= last + 1e-9) if step > 0 else (value >= last - 1e-9):
             out.append(value)
             value += step
-            if len(out) > 2000:
-                raise ValueError("that range is more than 2000 steps")
+            if len(out) > MAX_LIST_ITEMS:
+                raise ValueError(f"that range is more than {MAX_LIST_ITEMS} "
+                                 f"steps")
         return out
-    return [float(p) for p in text.replace(",", " ").split()]
+    out = [float(p) for p in text.replace(",", " ").split()]
+    if len(out) > MAX_LIST_ITEMS:
+        raise ValueError(f"that is {len(out)} values; {MAX_LIST_ITEMS} is as "
+                         f"long a sweep axis as this will take")
+    return out
 
 
 def code_of(snap, key, default=None):
@@ -513,9 +587,40 @@ def trace_yscale(snap):
 
 
 def binary_valid(snap):
-    """Whether the SPEB? dump can be used for the readout in force. The counts
-    are a dB mapping of the LogMag display, so the display has to be on it."""
-    return code_of(snap, "DISP0", 0) == 0
+    """Whether the SPEB? dump can be used for the readout in force.
+
+    Two things have to be known, not assumed. The counts are a dB mapping of
+    the LogMag display, so DISP0 has to say LogMag; and the rebase of bin 0
+    goes one way on dB units and quite another on volts, so UNIT0 decides
+    whether the dump comes out on the right scale at all.
+
+    Both are read with no default here, deliberately. Everywhere else a missing
+    DISP0 falls back to LogMag and a missing UNIT0 to dBV, because trace_units()
+    has to put something on the axis - but a setting that could not be read back
+    is an unknown display, not a LogMag one, and rebasing the dump against an
+    unknown display is how a volt trace comes back 160 dB adrift. Falling back
+    to the ASCII readout costs a minute. Guessing costs the measurement.
+    readout_fault() puts the same doubt on the label either way.
+    """
+    return code_of(snap, "DISP0") == 0 and code_of(snap, "UNIT0") is not None
+
+
+def binary_refusal(snap):
+    """Why binary_valid() said no, as the line to log, or "" when it said yes.
+
+    Here rather than at the three call sites that used to word it themselves,
+    because they had all learned the one reason there used to be - a linear
+    display - and none of them would have mentioned the new one."""
+    if binary_valid(snap):
+        return ""
+    unread = [BY_KEY[k].label for k in ("DISP0", "UNIT0")
+              if k in BY_KEY and snap.get(k) is None]
+    if unread:
+        return (f"{' and '.join(unread)} could not be read back, so there is "
+                f"no telling which way the binary dump would need rebasing - "
+                f"reading bin by bin instead")
+    return ("linear display: falling back to the ASCII readout, the binary "
+            "dump is a dB mapping")
 
 
 def span_hz(code):
@@ -532,7 +637,8 @@ def record_time(span_code, n_bins=N_BINS):
     return n_bins / hz if hz and np.isfinite(hz) and hz > 0 else float("nan")
 
 
-def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS):
+def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS,
+                 averaged=True):
     """How much independent averaging a run actually bought.
 
     NAVG counts records the analyzer averaged, not independent ones. With OVLP
@@ -550,20 +656,36 @@ def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS):
     is +/- 10%, about +/- 0.41 dB. It is the honest bar to put on a segment
     before comparing it with its neighbour.
 
+    All of that assumes the analyzer averaged what it acquired. `averaged` is
+    the caller saying whether it did - AVGO, in practice. With averaging off the
+    model collapses: the analyzer goes on acquiring records and goes on throwing
+    them away, so what is on the screen at the end of a ten minute run is the
+    newest record and nothing else. N_indep is 1 however long the run was, and
+    rel_err is 1 - a single periodogram bin of noise is exponentially
+    distributed, so its standard deviation equals its mean. The elapsed/T_rec
+    count would have claimed 29 records and a 0.19 bar for a 30 s run at the
+    390 Hz span, five times better than the trace really is.
+
     Returns a dict of plain numbers; NaN wherever the inputs do not support the
     calculation rather than a guess."""
     t_rec = record_time(span_code, n_bins)
     elapsed = float(elapsed_s)
-    n_indep = elapsed / t_rec if np.isfinite(t_rec) and t_rec > 0 else float("nan")
+    if averaged:
+        n_indep = (elapsed / t_rec
+                   if np.isfinite(t_rec) and t_rec > 0 else float("nan"))
+    else:
+        n_indep = 1.0
     rel_err = (1.0 / np.sqrt(n_indep)
                if np.isfinite(n_indep) and n_indep > 0 else float("nan"))
     out = {"t_rec_s": t_rec, "elapsed_s": elapsed, "n_indep": n_indep,
-           "rel_err": rel_err, "navg": navg, "overlap_pct": ovlp}
+           "rel_err": rel_err, "navg": navg, "overlap_pct": ovlp,
+           "averaged": bool(averaged)}
     # The ratio is the point of the whole calculation: it says how far NAVG is
-    # from what the run can actually support.
+    # from what the run can actually support. It is a statement about an average
+    # that was taken, so it means nothing when none was.
     out["navg_over_indep"] = (navg / n_indep
-                              if navg and np.isfinite(n_indep) and n_indep > 0
-                              else float("nan"))
+                              if averaged and navg and np.isfinite(n_indep)
+                              and n_indep > 0 else float("nan"))
     return out
 
 
@@ -581,8 +703,15 @@ def stats_notes(stats):
                                 if np.isfinite(stats.get("rel_err", np.nan))
                                 else "?"),
     }
+    if not stats.get("averaged", True):
+        notes["averaging"] = ("OFF - the trace is one record, so the bar above "
+                              "is a single bin's own scatter and not anything "
+                              "the length of the run bought")
     if stats.get("navg"):
-        notes["averages reported (NAVG)"] = f"{stats['navg']:g}"
+        notes["averages reported (NAVG)"] = (
+            f"{stats['navg']:g}"
+            + ("" if stats.get("averaged", True)
+               else "  <- not in force, averaging is off"))
         ratio = stats.get("navg_over_indep", float("nan"))
         if np.isfinite(ratio):
             notes["NAVG / independent"] = (
@@ -711,14 +840,20 @@ class SR760:
 
         ARNG has to go to manual first: writing IRNG while auto range is on
         sets a value the analyzer is free to move off again on the next
-        overload, which is the whole failure this exists to stop."""
-        self.put("ARNG 0")
-        self.put(f"IRNG {dbv:g}")
+        overload, which is the whole failure this exists to stop.
+
+        Through command() rather than spelled out, so that if this analyzer
+        turns out to answer the graph-indexed form of either command, the write
+        that pins the range moves with it. A bare "IRNG -30" against an analyzer
+        that wanted "IRNG 0,-30" is read as a graph number and pins nothing, and
+        says nothing about having done so."""
+        self.put(self.command("ARNG", 0))
+        self.put(self.command("IRNG", f"{dbv:g}"))
 
     def input_range(self):
         """The range the analyzer says it is on, as a float, or None."""
         try:
-            return float(self.get("IRNG?"))
+            return float(self.get(self.query_for("IRNG")))
         except Exception:
             self.recover()
             return None
@@ -769,8 +904,8 @@ class SR760:
         manual - otherwise a later run in the same sweep moves the range and the
         noise floors no longer compare. Returns the range it settled on and how
         often an overload bit showed up while it worked."""
-        self.put("ARNG 0")
-        self.put("ARNG 1")
+        self.put(self.command("ARNG", 0))
+        self.put(self.command("ARNG", 1))
         overloads = polls = 0
         deadline = time.time() + seconds
         while time.time() < deadline:
@@ -785,9 +920,9 @@ class SR760:
             if st.overloaded:
                 overloads += 1
             time.sleep(poll)
-        self.put("ARNG 0")
+        self.put(self.command("ARNG", 0))
         try:
-            rng = self.get("IRNG?")
+            rng = self.get(self.query_for("IRNG"))
         except Exception:
             self.recover()
             rng = "?"
@@ -1170,8 +1305,7 @@ class SR760:
             snap = self.read_all_settings()
         binary = prefer_binary and binary_valid(snap)
         if prefer_binary and not binary:
-            say("  (linear display: falling back to the ASCII readout, the "
-                "binary dump is a dB mapping)")
+            say(f"  ({binary_refusal(snap)})")
         if binary:
             try:
                 freqs, amps = self.trace_binary(trace, n_bins, reads_in_db(snap))

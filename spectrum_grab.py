@@ -42,11 +42,12 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    CONNECT_TIMEOUT_MS, DEFAULT_ADDRESS, DEFAULT_EXP_WAIT_S,
                    DEFAULT_SETTLE_RECS, N_BINS, PRESETS, READY_TIMEOUT_S,
                    SETTING_GROUPS, SETTLE_KEYS, SPACE_OWNERS, SPAN_CHOICES,
-                   SPANS, TRACE, averaging_fault, binary_valid, code_of,
-                   fmt_setting, hold_notes, label_of, metadata_text, parse_list,
-                   parse_setting, pretty_units, reads_in_db, record_stats,
-                   record_time, safe_name, span_hz, stats_notes, trace_units,
-                   trace_yscale, unique_base, write_csv)
+                   SPANS, TRACE, averaging_fault, binary_refusal, binary_valid,
+                   code_of, fmt_setting, hold_notes, label_of, metadata_text,
+                   parse_list, parse_setting, pretty_units, readout_fault,
+                   reads_in_db, record_stats, record_time, safe_name, span_hz,
+                   stats_notes, trace_units, trace_yscale, unique_base,
+                   write_csv)
 
 try:
     from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
@@ -82,6 +83,12 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
 PLOT_DPI = 300
 PEEK_DPI = 110                # a peek is only ever looked at in the preview box
 PREVIEW_W, PREVIEW_H = 440, 330
+
+# Most runs a sweep will set matrices aside for. The [case][start][span][bin]
+# pair is allocated whole before the first trace, at 6.4 kB a run, so this is
+# about 128 MB - far past any bench session, and the point is only that an
+# accidental sweep is refused in one line rather than allocated blindly.
+MAX_SWEEP_RUNS = 20000
 
 # Plot window used unless the trace falls outside it, and only for dB traces -
 # a linear trace is autoscaled instead.
@@ -1007,7 +1014,8 @@ class App:
             return
         on = self.arng_live.get()
         self.do_action(f"auto range {'on' if on else 'off'}",
-                       lambda: self.an.put(f"ARNG {1 if on else 0}"))
+                       lambda: self.an.put(
+                           self.an.command("ARNG", 1 if on else 0)))
 
     # -- range hold -------------------------------------------------------
 
@@ -1099,14 +1107,19 @@ class App:
     # -- settling ---------------------------------------------------------
 
     def settle_for(self, span_code):
-        """The settle wait, with the panel's record-length figure."""
+        """The settle wait, with the panel's record-length figure.
+
+        The flag is cleared once the wait has been served, and not before. It
+        used to be cleared in a finally, which meant a settle cut short by Stop
+        left the analyzer marked as settled: press Stop during the wait after a
+        span change, press GRAB again, and the trace came off a filter chain
+        still full of the previous span with nothing saying so."""
         recs = self.float_of(self.settle_recs, DEFAULT_SETTLE_RECS,
                              "settle record lengths")
-        try:
-            return self.an.settle(recs, span_code, stop=self.abort.is_set,
-                                  log=self.log)
-        finally:
-            self.settle_due.clear()
+        notes = self.an.settle(recs, span_code, stop=self.abort.is_set,
+                               log=self.log)
+        self.settle_due.clear()
+        return notes
 
     def do_average(self):
         """Restart the average and wait it out, writing nothing.
@@ -1176,10 +1189,14 @@ class App:
             snap = self.read_all_settings()
             self.root.after(0, lambda v=snap: self.show_settings(v))
             ylabel = trace_units(snap)
+            # A peek saves nothing, so there is no metadata to carry this - it
+            # has to be said in the log or the picture is read at face value.
+            bad_read = readout_fault(snap)
+            if bad_read:
+                self.log(f"  *** SUSPECT: {bad_read} ***")
             binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:
-                self.log("  (linear display: reading bin by bin, which takes a "
-                         "moment - the binary dump is a dB mapping)")
+                self.log(f"  ({binary_refusal(snap)})")
             t0 = time.perf_counter()
             if binary:
                 try:
@@ -1241,9 +1258,33 @@ class App:
                          daemon=True).start()
 
     def _grab_worker(self, cases, starts, spans):
+        """Wrapper. The buttons are handed back here and nowhere else.
+
+        A worker that dies on its way out of the run leaves set_busy(True) in
+        force, and there is no way back from that: every action returns early on
+        self.busy, Connect is disabled, and Stop only sets the abort flag. Under
+        pythonw the traceback has no console to reach either, so the app simply
+        stops responding and has to be restarted. The allocation below used to
+        sit outside the try, which is exactly where an oversized sweep raises.
+        """
+        try:
+            self._grab_runs(cases, starts, spans)
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+        finally:
+            self.root.after(0, self.save_config)
+            self.root.after(0, lambda: self.set_busy(False))
+
+    def _grab_runs(self, cases, starts, spans):
         outdir = self.target_dir()
         stamp = datetime.datetime.now().strftime("%Y%m%d")
         total = len(cases) * len(starts) * len(spans)
+        if total > MAX_SWEEP_RUNS:
+            self.log(f"That is {total} runs ({len(cases)} case(s) x "
+                     f"{len(starts)} start freq(s) x {len(spans)} span(s)), "
+                     f"past the {MAX_SWEEP_RUNS} this will set matrices aside "
+                     f"for. Trim the sweep lists.")
+            return
 
         # Axes kept in the shape the bench scripts used, so a sweep with one
         # case squeezes down to their [variable, span, bin] matrices. Cells are
@@ -1254,6 +1295,12 @@ class App:
         amps_m = np.full_like(freqs_m, np.nan)
         done = []
         ended = ""
+        # The y axis the combined plot will carry, taken from the snapshot of
+        # the last run that actually happened rather than from self.last_ylabel:
+        # that is updated on the main thread through after(0, ...) and this runs
+        # on the worker, so reading it here is a race that can label a sweep
+        # with the previous capture's units.
+        sweep_ylabel, sweep_yscale = self.last_ylabel, self.last_yscale
 
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -1269,11 +1316,17 @@ class App:
                     if start is not None:
                         # .10g, not %g: a stitch step is rarely a round number
                         # and 6 digits would shave a fraction of a bin off it.
-                        self.an.put(f"STRF {start:.10g}")
+                        # Through command(), so that if this analyzer answers
+                        # the graph-indexed spelling of STRF or SPAN the sweep
+                        # moves with it - a bare "SPAN 11" against an analyzer
+                        # that wanted "SPAN 0,11" is read as a graph number and
+                        # silently changes nothing, which is the one failure the
+                        # qform machinery exists to catch.
+                        self.an.put(self.an.command("STRF", f"{start:.10g}"))
                         self.settle_due.set()
                     for isp, span in enumerate(spans):
                         if span is not None:
-                            self.an.put(f"SPAN {span}")
+                            self.an.put(self.an.command("SPAN", span))
                             self.settle_due.set()
                         if self.abort.is_set():
                             raise KeyboardInterrupt
@@ -1287,6 +1340,8 @@ class App:
                         freqs, amps, snap, notes = self.run_one()
                         freqs_m[ic, isf, isp] = freqs
                         amps_m[ic, isf, isp] = amps
+                        sweep_ylabel = trace_units(snap)
+                        sweep_yscale = trace_yscale(snap)
                         done.append((freqs, amps, label or self.safe_title()))
                         self.save_run(outdir, stamp, case, freqs, amps, snap,
                                       notes)
@@ -1310,11 +1365,10 @@ class App:
         try:
             if done and total > 1:
                 self.save_sweep(outdir, stamp, cases, starts, spans,
-                                freqs_m, amps_m, done, total, ended)
+                                freqs_m, amps_m, done, total, ended,
+                                sweep_ylabel, sweep_yscale)
         except Exception as exc:
             self.log(f"ERROR: the sweep files could not be written: {exc}")
-        self.root.after(0, self.save_config)
-        self.root.after(0, lambda: self.set_busy(False))
 
     def run_one(self):
         """One measurement: range, average, read out. Returns the trace, the
@@ -1417,6 +1471,22 @@ class App:
                                          .removeprefix("SUSPECT: ")]
             if over:
                 faults.append("overload flagged during the run")
+            elif not status.complete:
+                # Half a status byte is not a clean one: an ERRS that came back
+                # clear says nothing about the FFT overload in FFTS. Same
+                # standard the range hold is held to - unverified and verified
+                # are different claims, and only one belongs on a trace a
+                # comparison rests on.
+                silent = " and ".join(name for name, value
+                                      in (("ERRS", status.errs),
+                                          ("FFTS", status.ffts))
+                                      if value is None)
+                faults.append(f"overload unverified: {silent} did not answer")
+            # Which scale the trace is labelled on, and whether that was read or
+            # assumed. An assumed UNIT0 is a 160 dB assumption.
+            bad_read = readout_fault(snap)
+            if bad_read:
+                faults.append(bad_read)
             bad_avg = averaging_fault(snap)
             if bad_avg:
                 faults.append(bad_avg)
@@ -1424,13 +1494,19 @@ class App:
                                       else hold.get("trace quality", "clean"))
             if faults:
                 self.log(f"  *** {notes['trace quality']} ***")
+            # `averaged` because the elapsed/T_rec count assumes the analyzer
+            # averaged what it acquired. With AVGO off it averages nothing and
+            # keeps only the newest record, so the run length buys no statistics
+            # at all and the error bar is a single bin's own. An unreadable AVGO
+            # takes the same branch, which is the safe direction to be wrong in,
+            # and averaging_fault has already said so above.
             notes.update(stats_notes(record_stats(
                 code_of(snap, "SPAN", span_code), measured,
-                navg=code_of(snap, "NAVG"), ovlp=code_of(snap, "OVLP"))))
+                navg=code_of(snap, "NAVG"), ovlp=code_of(snap, "OVLP"),
+                averaged=code_of(snap, "AVGO", 0) == 1)))
             binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:
-                self.log("  (linear display: falling back to the ASCII readout, "
-                         "the binary dump is a dB mapping)")
+                self.log(f"  ({binary_refusal(snap)})")
 
             t0 = time.perf_counter()
             if binary:
@@ -1472,13 +1548,16 @@ class App:
         if start:
             parts.append(f"strf{start:g}Hz")
         parts += [f"{maxfreq}Hz", stamp]
-        wanted = [e for e, on in ((".csv", self.save_csv.get()),
-                                  (".png", self.save_png.get()),
-                                  (".txt", self.save_txt.get())) if on]
-        if not wanted:
+        if not (self.save_csv.get() or self.save_png.get()
+                or self.save_txt.get()):
             self.log("  (nothing ticked to save)")
             return
-        base = unique_base(outdir, "_".join(parts), wanted)
+        # Every extension, not only the ticked ones. unique_base tests them
+        # together so that a capture's three files share a name - but handing it
+        # just what this run is about to write lets a run with the metadata
+        # unticked land on a stem an earlier run's .txt already holds, and the
+        # two then read as one capture while describing different settings.
+        base = unique_base(outdir, "_".join(parts), (".csv", ".png", ".txt"))
         stem = os.path.basename(base)
 
         if self.save_csv.get():
@@ -1584,7 +1663,7 @@ class App:
         self.root.after(0, lambda p=path: self.show_preview(p))
 
     def save_sweep(self, outdir, stamp, cases, starts, spans, freqs_m, amps_m,
-                   done, planned, ended=""):
+                   done, planned, ended="", ylabel=None, yscale=None):
         """The whole sweep in one place: the raw matrices, a JSON note of what
         each axis means, and every trace on one pair of axes.
 
@@ -1618,13 +1697,18 @@ class App:
                         if len(done) < planned else ""))
         if self.combined.get():
             # Every run in a sweep is measured the same way, so they share a y
-            # axis - the label comes from the last settings snapshot.
+            # axis - the label comes from the settings snapshot of the last run
+            # that happened, handed in by the caller. self.last_ylabel is the
+            # fallback only: it is written on the main thread and read here on
+            # the worker, so it can still be the previous capture's units.
             subtitle = SUBTITLE_SEP.join(
                 [f"{len(done)} of {planned} runs"
                  + (f" - {ended}" if ended else ""),
                  datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
             self.write_plot(base + ".png", done, self.plot_title(note="sweep"),
-                            subtitle, self.last_ylabel, self.last_yscale)
+                            subtitle,
+                            self.last_ylabel if ylabel is None else ylabel,
+                            self.last_yscale if yscale is None else yscale)
 
     # -- settings panel ---------------------------------------------------
 
@@ -1818,7 +1902,17 @@ class App:
             ms = max(1000, int(float(self.interval.get()) * 1000))
         except ValueError:
             ms = 60000
-        self.do_grab()
+        # Say when a scheduled grab could not run. do_grab returns without a
+        # word if the panel is busy or the analyzer has gone, so an unattended
+        # overnight run would otherwise come back to fewer files than expected
+        # and nothing in the log to say which ones are missing or why.
+        if self.busy:
+            self.log("Auto-grab skipped: the previous run has not finished. "
+                     "Lengthen the interval or shorten the sweep.")
+        elif not self.an.inst:
+            self.log("Auto-grab skipped: not connected.")
+        else:
+            self.do_grab()
         self.auto_job = self.root.after(ms, self.schedule_auto)
 
     def on_close(self):
