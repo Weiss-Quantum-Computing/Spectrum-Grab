@@ -57,11 +57,12 @@ __all__ = [
     "MAX_FREQ",
     "MAX_LIST_ITEMS", "Setting", "spellings", "num", "enum", "SETTING_GROUPS",
     "ALL_SETTINGS", "BY_KEY", "fmt_setting", "parse_setting", "parse_list",
-    "code_of", "label_of", "trace_units", "pretty_units", "reads_in_db",
+    "code_of", "value_of", "label_of", "trace_units", "pretty_units",
+    "reads_in_db",
     "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
     "SPAN_RESETS", "OVLP_ADVANCE_S", "default_overlap",
     "independent_records",
-    "record_stats", "stats_notes", "averaging_fault", "readout_fault",
+    "record_stats", "stats_notes", "averaging_fault", "overlap_fault", "readout_fault",
     "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
     "TRANSFER_BINARY_S", "TRANSFER_ASCII_S", "fmt_hms", "capture_time",
     "UNIT_BASES", "unit_parts", "canonical_units", "to_volts_pk",
@@ -331,6 +332,44 @@ def averaging_fault(snap):
     return ""
 
 
+def overlap_fault(snap, span_code=None):
+    """Why the overlap in force makes NAVG a poor description of this trace.
+
+    The statistics in the metadata do not depend on this: record_stats counts
+    independent records from the clock, elapsed over T_rec, which is right
+    whatever the overlap turns out to be. What this adds is the attribution.
+    NAVG is the number on the front panel and the number anyone reads off the
+    file, and when the overlap has eaten it the useful thing to say is not only
+    that it was eaten but what ate it.
+
+    A SPAN write reinstalls that span's default overlap - see default_overlap -
+    so an overlap sitting exactly on the default is the signature of one that
+    was installed rather than chosen. It can also be a deliberate choice, which
+    is why the message says "may have" and why this only speaks when the overlap
+    is actually costing something: at or below 1.5x, the same threshold
+    stats_notes calls out, there is nothing here worth a flag.
+    """
+    if code_of(snap, "AVGO", 0) != 1 or code_of(snap, "AVGM", 0) != 0:
+        return ""                     # averaging_fault owns those
+    navg, ovlp = code_of(snap, "NAVG"), value_of(snap, "OVLP")
+    if not navg or ovlp is None or ovlp <= 0:
+        return ""
+    worth = independent_records(navg, ovlp)
+    if not np.isfinite(worth) or navg / worth <= 1.5:
+        return ""
+    msg = (f"{ovlp:g}% overlap: {navg:g} averages are worth {worth:.3g} "
+           f"independent records, so NAVG overstates the statistics "
+           f"{navg / worth:.0f}x")
+    if span_code is None:
+        return msg
+    default = default_overlap(span_code)
+    if default > 0 and abs(ovlp - default) < 0.5:
+        return (msg + f" - and {ovlp:g}% is this span's default, so a SPAN "
+                      f"write may have installed it in place of the value "
+                      f"that was asked for")
+    return msg
+
+
 def readout_fault(snap):
     """Why the scale this trace is labelled on is an assumption, or "".
 
@@ -550,6 +589,22 @@ def code_of(snap, key, default=None):
     """One instrument code out of a settings snapshot, as an int."""
     try:
         return int(float(snap[key]))
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def value_of(snap, key, default=None):
+    """One setting out of a snapshot as a float.
+
+    The counterpart of code_of for the `num` settings. code_of truncates - it
+    is reading an enum's index, where an int is the whole point - and that is
+    wrong for anything measured: OVLP 98.4375 came back from it as 98, which
+    put a fifth of an independent record into every count derived from it and
+    hid a reinstalled overlap from the check that looks for one. Use code_of
+    for a choice, value_of for a quantity.
+    """
+    try:
+        return float(snap[key])
     except (KeyError, TypeError, ValueError):
         return default
 

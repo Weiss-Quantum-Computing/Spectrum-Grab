@@ -562,6 +562,21 @@ notes = capture(GOOD, errs=128, ffts=0)
 ok("a real overload is still reported as one",
    "overload flagged" in notes["trace quality"], notes["trace quality"][:56])
 
+# A span 11 capture whose overlap is sitting on that span's default: NAVG 400
+# is worth 7.23 records, and the trace has to say so. Nothing else would - the
+# statistics come from the clock and are right either way.
+notes = capture(dict(GOOD, NAVG="400", OVLP="98.4375"))
+ok("an overlap eating the averaging marks the trace",
+   notes["trace quality"].startswith("SUSPECT"), notes["trace quality"][:64])
+ok("... saying what NAVG is worth",
+   "worth 7.23 independent" in notes["trace quality"])
+ok("... and that the span may have put it there",
+   "this span's default" in notes["trace quality"])
+ok("... while the metadata still reports the overlap unrounded",
+   notes["overlap (%)"] == "98.4375", notes.get("overlap (%)"))
+ok("a protocol capture at OVLP 0 stays clean",
+   capture(dict(GOOD, NAVG="400", OVLP="0"))["trace quality"] == "clean")
+
 notes = capture(GOOD, pinned=-30.0)
 ok("a range that held is verified against the pin",
    notes["trace quality"] == "clean: range verified against the pin",
@@ -1622,6 +1637,60 @@ ok("an impossible overlap does not divide by zero",
 ok("capture_time is this count times the record length",
    abs(S.capture_time(11, navg=400, ovlp=93.75, transfer_s=0)
        - S.record_time(11) * S.independent_records(400, 93.75)) < 1e-9)
+
+print("\n--- reading a quantity out of a snapshot ---")
+
+# Was: code_of everywhere. It truncates, which is the point for an enum index
+# and wrong for anything measured - OVLP 98.4375 came back 98, which put a fifth
+# of a record into every count derived from it and hid a reinstalled overlap
+# from the check that looks for one.
+ok("code_of truncates, because an enum index is an int",
+   S.code_of({"OVLP": "98.4375"}, "OVLP") == 98)
+ok("value_of does not, because an overlap is a quantity",
+   S.value_of({"OVLP": "98.4375"}, "OVLP") == 98.4375)
+ok("... and it falls back like code_of does",
+   S.value_of({}, "OVLP", 0.0) == 0.0
+   and S.value_of({"OVLP": "what"}, "OVLP") is None)
+
+print("\n--- the overlap check ---")
+
+AVG = {"AVGO": "1", "AVGM": "0", "AVGT": "0"}
+ok("no overlap, nothing to say",
+   S.overlap_fault(dict(AVG, NAVG="100", OVLP="0"), 11) == "")
+ok("an overlap that costs little says nothing either",
+   S.overlap_fault(dict(AVG, NAVG="400", OVLP="20"), 11) == "")
+
+f = S.overlap_fault(dict(AVG, NAVG="400", OVLP="98.4375"), 11)
+ok("span 11's default is caught", "98.4375% overlap" in f, f[:56])
+ok("... with what NAVG is really worth", "worth 7.23 independent" in f, f[:70])
+ok("... and how far it overstates", "overstates the statistics 55x" in f)
+ok("... and that the span may have installed it",
+   "this span's default" in f and "may have" in f)
+
+f = S.overlap_fault(dict(AVG, NAVG="300", OVLP="93.75"), 13)
+ok("so is span 13's, at the 26 Aug setting",
+   "worth 19.7 independent" in f and "this span's default" in f, f[:60])
+
+# A deliberate overlap is still worth flagging for what it costs, but it is not
+# the span's doing and must not be blamed on it.
+f = S.overlap_fault(dict(AVG, NAVG="400", OVLP="90"), 11)
+ok("a chosen overlap is flagged for its cost", "overstates" in f, f[:50])
+ok("... but not blamed on the span", "this span's default" not in f, f[:60])
+
+ok("averaging off is averaging_fault's business",
+   S.overlap_fault(dict(AVG, AVGO="0", NAVG="400", OVLP="98.4375"), 11) == "")
+ok("so is exponential",
+   S.overlap_fault(dict(AVG, AVGM="1", NAVG="400", OVLP="98.4375"), 11) == "")
+ok("an unreadable OVLP is not guessed at",
+   S.overlap_fault(dict(AVG, NAVG="400"), 11) == "")
+ok("without a span it still reports the cost, just not the cause",
+   "overstates" in S.overlap_fault(dict(AVG, NAVG="400", OVLP="98.4375"), None)
+   and "default" not in S.overlap_fault(dict(AVG, NAVG="400", OVLP="98.4375"),
+                                        None))
+# Span 19's default IS zero, which is why the 30 Aug set looked healthy on the
+# one trace anyone spot-checked.
+ok("at span 19 there is no default to mistake anything for",
+   S.overlap_fault(dict(AVG, NAVG="400", OVLP="0"), 19) == "")
 
 print("\n--- and what the panel says about it ---")
 

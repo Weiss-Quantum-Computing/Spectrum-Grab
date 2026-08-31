@@ -49,9 +49,11 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    convert_amplitude, fmt_hms, fmt_setting, hold_notes,
                    independent_records,
                    label_of, metadata_text, parse_list, parse_setting,
-                   pretty_units, read_csv, readout_fault, reads_in_db,
+                   overlap_fault, pretty_units, read_csv, readout_fault,
+                   reads_in_db,
                    record_stats, record_time, safe_name, span_hz, stats_notes,
                    trace_units, trace_yscale, unique_base, unit_parts,
+                   value_of,
                    write_csv)
 
 try:
@@ -1964,7 +1966,7 @@ class App:
             autorange = self.float_of(self.arng_s, 15.0, "auto-range time")
         per = [capture_time(
             code,
-            navg=code_of(snap, "NAVG"), ovlp=code_of(snap, "OVLP"),
+            navg=code_of(snap, "NAVG"), ovlp=value_of(snap, "OVLP"),
             averaged=averaged,
             settle_recs=(self.float_of(self.settle_recs, DEFAULT_SETTLE_RECS,
                                        "settle record lengths")
@@ -2135,6 +2137,15 @@ class App:
             bad_avg = averaging_fault(snap)
             if bad_avg:
                 faults.append(bad_avg)
+            # What the overlap has done to NAVG, and whether it looks like the
+            # span put it there. The statistics below do not depend on this -
+            # record_stats counts from the clock - but NAVG is the number that
+            # ends up quoted, and this says what it is really worth. Given the
+            # span from the snapshot, falling back to the one read before the
+            # run so a dead SPAN does not silence the check.
+            bad_ovlp = overlap_fault(snap, code_of(snap, "SPAN", span_code))
+            if bad_ovlp:
+                faults.append(bad_ovlp)
             notes["trace quality"] = ("SUSPECT: " + "; ".join(faults) if faults
                                       else hold.get("trace quality", "clean"))
             if faults:
@@ -2147,7 +2158,7 @@ class App:
             # and averaging_fault has already said so above.
             notes.update(stats_notes(record_stats(
                 code_of(snap, "SPAN", span_code), measured,
-                navg=code_of(snap, "NAVG"), ovlp=code_of(snap, "OVLP"),
+                navg=code_of(snap, "NAVG"), ovlp=value_of(snap, "OVLP"),
                 averaged=code_of(snap, "AVGO", 0) == 1)))
             binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:

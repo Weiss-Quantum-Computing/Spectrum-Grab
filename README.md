@@ -131,6 +131,27 @@ settles on a count, so the statistics cannot be stated. Either one marks the
 trace `SUSPECT` in the metadata and on the plot; the protocol runner refuses to
 start at all.
 
+`overlap_fault()` is the third of them, and it is about attribution rather than
+arithmetic. The statistics do not depend on it — `record_stats` counts
+independent records from the clock, `elapsed / T_rec`, which is right whatever
+the overlap turns out to be — but NAVG is the number on the front panel and the
+number anyone reads off the file, so when the overlap has eaten it the trace
+should say what ate it:
+
+```
+SUSPECT: 98.4375% overlap: 400 averages are worth 7.23 independent records,
+so NAVG overstates the statistics 55x - and 98.4375% is this span's default,
+so a SPAN write may have installed it in place of the value that was asked for
+```
+
+It only speaks when the overlap is actually costing something — past 1.5x, the
+threshold `stats_notes` uses — and it names the span only when the overlap sits
+exactly on that span's default, since it can also be a deliberate choice.
+
+`code_of()` reads an enum's index and truncates, which is right for a choice and
+wrong for a quantity: `OVLP 98.4375` came back from it as `98`. **`value_of()`
+is the one to use for the `num` settings.**
+
 ## The status byte is cached
 
 Reading an SR760 status byte **clears** it, so whoever reads first consumes the
