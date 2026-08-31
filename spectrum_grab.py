@@ -42,7 +42,7 @@ import numpy as np
 from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    CONNECT_TIMEOUT_MS, DEFAULT_ADDRESS, DEFAULT_EXP_WAIT_S,
                    DEFAULT_SETTLE_RECS, MAX_FREQ, MAX_LIST_ITEMS, N_BINS,
-                   PRESETS, READY_TIMEOUT_S, SETTING_GROUPS, SETTLE_KEYS,
+                   READY_TIMEOUT_S, SETTING_GROUPS, SETTLE_KEYS,
                    SPACE_OWNERS, SPAN_CHOICES, SPANS, TRACE, TRANSFER_ASCII_S,
                    TRANSFER_BINARY_S, averaging_fault, binary_refusal,
                    binary_valid, canonical_units, capture_time, code_of,
@@ -124,7 +124,10 @@ DEFAULT_YMIN, DEFAULT_YMAX = -160.0, -20.0
 # wider every time a grab finished, then back again on the next peek.
 CAPTION_CHARS = 58            # under the preview
 STATUS_CHARS = 64             # the connection, hold and compare lines
-AVG_BOX_W = 420               # the what-the-averaging-is-worth read-out
+MIN_W, MIN_H = 900, 700       # a floor for fit_window on a small screen
+AVG_BOX_W, AVG_BOX_H = 215, 34   # the what-the-averaging-is-worth read-out,
+#                                  sized to the cell the Averaging group leaves
+#                                  empty rather than to a strip of its own
 
 
 def elide(text, width):
@@ -370,9 +373,6 @@ class App:
         self.settle_due = threading.Event()
 
         root.title("Spectrum Grab - SR760 FFT")
-        win_w = min(1180, root.winfo_screenwidth() - 60)
-        win_h = min(950, root.winfo_screenheight() - 80)
-        root.geometry(f"{win_w}x{win_h}+30+15")
 
         pad = dict(padx=8, pady=4)
         body = ttk.Frame(root)
@@ -395,6 +395,7 @@ class App:
 
         root.bind("<space>", self.on_space)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.fit_window()
         self.saved_cfg = None
         if Figure is None:
             self.log("matplotlib is not installed for this Python, so there are "
@@ -405,6 +406,25 @@ class App:
         self.root.after(100, self.pump)
         self.root.after(300, self.do_connect)
         self.load_latest_preview()
+
+    def fit_window(self):
+        """Size the window to what the panel actually asks for, capped by the
+        screen.
+
+        It used to be a flat 1180x950, which the settings column overran by 40
+        px - Read and Apply sat 7 px inside the bottom edge and anything that
+        grew the column pushed them out of reach. Asking the panel how tall it
+        is means a line added to a read-out costs a taller window rather than a
+        button, and MIN_H keeps a screen that cannot fit it from collapsing the
+        thing to nothing.
+        """
+        self.root.update_idletasks()
+        screen_w = self.root.winfo_screenwidth() - 60
+        screen_h = self.root.winfo_screenheight() - 80
+        wide = min(max(self.root.winfo_reqwidth(), MIN_W), screen_w)
+        high = min(max(self.root.winfo_reqheight(), MIN_H), screen_h)
+        self.root.geometry(f"{wide}x{high}+30+15")
+        return wide, high
 
     # -- layout -----------------------------------------------------------
 
@@ -450,7 +470,7 @@ class App:
         ttk.Checkbutton(row, text="csv", variable=self.save_csv).pack(side="left",
                                                                      padx=8)
         self.save_png = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="plot", variable=self.save_png).pack(side="left")
+        ttk.Checkbutton(row, text="png", variable=self.save_png).pack(side="left")
         self.save_txt = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="metadata", variable=self.save_txt).pack(
             side="left", padx=8)
@@ -715,19 +735,30 @@ class App:
                     row=row, column=col * 2, sticky="e", padx=(0, 4), pady=1)
                 self.setting_widget(grid, s, row, col * 2 + 1)
             if group == "Averaging":
-                # What the two boxes above are actually worth. NAVG counts
-                # records the analyzer averaged, not independent ones, and SPAN
-                # reinstalls its own default overlap - 98.44% at the narrow end
-                # - so NAVG can be honoured to the letter while the trace is
-                # worth a fifty-fifth of it. Nothing to fill in: it reads the
-                # boxes as they are typed, before Apply, so a setting can be
-                # priced before it is sent.
-                box = tk.Frame(frame, width=AVG_BOX_W, height=32)
-                box.pack(fill="x", padx=8, pady=(0, 6))
+                # What the boxes above are actually worth, in the cell the group
+                # leaves empty: five settings laid out two to a row fill five of
+                # six places, so this costs no height at all. It used to sit in
+                # a strip underneath, which pushed Read and Apply off the bottom
+                # of the panel.
+                #
+                # NAVG counts records the analyzer averaged, not independent
+                # ones, and SPAN reinstalls its own default overlap - 98.4375%
+                # at the narrow end - so NAVG can be honoured to the letter
+                # while the trace is worth a fifty-fifth of it. Nothing to fill
+                # in: it reads the boxes as they are typed, before Apply.
+                row = (len(settings) - 1) // 2
+                box = tk.Frame(grid, width=AVG_BOX_W, height=AVG_BOX_H)
+                box.grid(row=row, column=2, columnspan=2, sticky="w",
+                         padx=(2, 0))
+                # pack_propagate, not grid_propagate: the frame is PLACED with
+                # grid but its label PACKS inside it, and it is the inner
+                # manager that has to be told to stop asking. With the wrong one
+                # the box grew from 18 px to 46 as the read-out gained a line,
+                # which is the whole thing this is here to avoid.
                 box.pack_propagate(False)
-                self.avg_worth = ttk.Label(box, text="", anchor="w",
-                                           justify="left",
-                                           wraplength=AVG_BOX_W - 8)
+                self.avg_worth = ttk.Label(box, text="", anchor="nw",
+                                           justify="left", font=("", 8),
+                                           wraplength=AVG_BOX_W - 4)
                 self.avg_worth.pack(fill="both", expand=True)
 
         bar = ttk.Frame(parent)
@@ -739,14 +770,6 @@ class App:
                                     command=self.do_apply_settings,
                                     state="disabled")
         self.apply_btn.pack(side="left", padx=4)
-        # Which preset Defaults stages. `protocol` first because it is the one
-        # a new session should be reaching for; `legacy` is there to reproduce
-        # the old data, not to take new data with.
-        self.preset = tk.StringVar(value="protocol")
-        ttk.Combobox(bar, textvariable=self.preset, values=list(PRESETS),
-                     width=9, state="readonly").pack(side="left", padx=(8, 2))
-        ttk.Button(bar, text="Stage preset",
-                   command=self.do_defaults).pack(side="left", padx=2)
         self.aoff_btn = ttk.Button(bar, text="Auto-offset",
                                    command=lambda: self.do_action(
                                        "auto offset", lambda: self.an.put("AOFF"),
@@ -2539,29 +2562,25 @@ class App:
                 return float("nan")
 
         if shown("AVGO") != "On":
-            return ("averaging off - the trace is one record, 1 sigma 100%",
-                    False)
+            return "averaging off:\none record, 1 sigma 100%", False
         kind = shown("AVGT")
         if kind and kind != "RMS":
-            return (f"{kind.lower()} - only RMS averaging measures noise",
-                    False)
+            return f"{kind.lower()}:\nnot noise averaging", False
         if shown("AVGM") == "Exponential":
-            return ("exponential - a running average of no definite depth, "
-                    "so there is no count to state", False)
+            return "exponential:\nno definite depth", False
         navg, ovlp = number("NAVG"), number("OVLP")
         n = independent_records(navg, ovlp)
         if not np.isfinite(n):
-            return ("(set the number of averages to see what it is worth)",
-                    True)
+            return "set a number of\naverages", True
         rel = 1.0 / np.sqrt(n)
-        line = (f"{navg:g} averages at {ovlp:g}% overlap = {n:.1f} independent "
-                f"records, 1 sigma {rel:.3g} ({10 * np.log10(1 + rel):.2f} dB)")
+        # Two lines, always. "7.23 of 400" says the overlap has eaten the
+        # averaging more plainly than a multiplier would, and a third line for
+        # it did not fit the cell - it was drawn 8 px past the bottom.
         # 1.5 is the same threshold stats_notes calls out in the metadata.
-        if navg / n > 1.5:
-            return (line + f"\nNAVG overstates the statistics {navg / n:.0f}x "
-                           f"- SPAN sets this overlap unless it is re-asserted",
-                    False)
-        return line, True
+        short = navg / n > 1.5
+        return (f"worth {f'{n:.3g} of {navg:g}' if short else f'all {navg:g}'} "
+                f"records\n1 sigma {rel:.3g} ({10 * np.log10(1 + rel):.2f} dB)",
+                not short)
 
     def refresh_averaging(self):
         """Main thread. Keep the read-out under Averaging telling the truth."""
@@ -2660,30 +2679,13 @@ class App:
         threading.Thread(target=self._settings_worker, args=(changes,),
                          daemon=True).start()
 
-    def do_defaults(self):
-        """Stage the chosen preset. Nothing goes to the analyzer until Apply, so
-        the whole block can be looked over first.
-
-        Two presets rather than one, because a single block cannot be both a
-        reproduction of history and a statement of current discipline: `legacy`
-        is what the bench scripts set, auto range and all; `protocol` is the RIN
-        validation discipline, pinned range and zero overlap."""
-        name = self.preset.get()
-        preset = PRESETS.get(name)
-        if preset is None:
-            self.log(f"No preset called {name!r}.")
-            return
-        for key, code in preset.items():
-            if key in self.set_vars:
-                self.set_vars[key].set(fmt_setting(BY_KEY[key], code))
-        skipped = [k for k in preset if k not in self.set_vars]
-        self.log(f"Preset '{name}' staged ({len(preset)} settings) - press "
-                 f"Apply changes to send them.")
-        if name == "protocol":
-            self.log("  (span and start frequency are per-segment and are not "
-                     "in this preset)")
-        if skipped:
-            self.log(f"  (not in the panel, so not staged: {', '.join(skipped)})")
+    # Stage preset is gone from the panel. Two blocks to choose between, one
+    # of them a reproduction of how the old data was taken, made every session
+    # start with a decision about which discipline was in force - and the panel
+    # already shows every setting and marks the ones that differ from the
+    # analyzer, which is the same information without the choice. sr760.PRESETS
+    # stays: the protocol runner applies it by name, where a script has no
+    # panel to read.
 
     def _settings_worker(self, changes):
         try:

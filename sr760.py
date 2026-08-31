@@ -52,7 +52,8 @@ __all__ = [
     "DEFAULT_ADDRESS", "TRACE", "N_BINS", "CONNECT_TIMEOUT_MS",
     "OP_TIMEOUT_MS", "SETTINGS_TIMEOUT_MS", "READY_PROBE", "READY_POLL_MS",
     "READY_TIMEOUT_S", "DEFAULT_EXP_WAIT_S", "DEFAULT_SETTLE_RECS",
-    "SETTLE_KEYS", "SPACE_OWNERS", "BAD_NAME_CHARS", "SPANS", "SPAN_CHOICES",
+    "SETTLE_KEYS", "SPACE_OWNERS", "BAD_NAME_CHARS", "SPAN_TOP_HZ",
+    "SPAN_LABELS", "SPANS", "SPAN_CHOICES",
     "MAX_FREQ",
     "MAX_LIST_ITEMS", "Setting", "spellings", "num", "enum", "SETTING_GROUPS",
     "ALL_SETTINGS", "BY_KEY", "fmt_setting", "parse_setting", "parse_list",
@@ -115,14 +116,26 @@ BAD_NAME_CHARS = r'<>:"/\|?*'
 
 # Span is set by code, not by frequency, so this table is the only way back to
 # Hz - which the file names, the stitch helper and the metadata all need.
-SPANS = [
-    ("191 mHz", 0.191), ("382 mHz", 0.382), ("763 mHz", 0.763), ("1.5 Hz", 1.5),
-    ("3.1 Hz", 3.1), ("6.1 Hz", 6.1), ("12.2 Hz", 12.2), ("24.4 Hz", 24.4),
-    ("48.75 Hz", 48.75), ("97.5 Hz", 97.5), ("195 Hz", 195.0), ("390 Hz", 390.0),
-    ("780 Hz", 780.0), ("1.56 kHz", 1560.0), ("3.125 kHz", 3125.0),
-    ("6.25 kHz", 6250.0), ("12.5 kHz", 12500.0), ("25 kHz", 25000.0),
-    ("50 kHz", 50000.0), ("100 kHz", 100000.0),
-]
+# The labels are the analyzer's own, as printed on the front panel and in the
+# manual. The frequencies are NOT: the manual rounds them for display, and this
+# table used to carry the rounded figures - 390 Hz for a span that is really
+# 390.625, 1.56 kHz for 1562.5.
+#
+# Every span is the widest one halved, exactly, and the instrument agrees. The
+# default overlap a SPAN write installs is whatever holds a 16 ms record
+# advance, and it was measured at exactly 93.75 % on code 13 and 98.4375 % on
+# code 11 (31 Aug 2026, s/n 41234). Those are 1 - 0.016/T_rec for T_rec of
+# 0.256 s and 1.024 s, which are 400 bins over 1562.5 Hz and 390.625 Hz. The
+# rounded table gave 93.76 and 98.44 instead, and every record length, settle,
+# run estimate and independent-record count inherited the error.
+SPAN_TOP_HZ = 100000.0
+SPAN_LABELS = (
+    "191 mHz", "382 mHz", "763 mHz", "1.5 Hz", "3.1 Hz", "6.1 Hz", "12.2 Hz",
+    "24.4 Hz", "48.75 Hz", "97.5 Hz", "195 Hz", "390 Hz", "780 Hz", "1.56 kHz",
+    "3.125 kHz", "6.25 kHz", "12.5 kHz", "25 kHz", "50 kHz", "100 kHz",
+)
+SPANS = [(label, SPAN_TOP_HZ / 2.0 ** (len(SPAN_LABELS) - 1 - i))
+         for i, label in enumerate(SPAN_LABELS)]
 SPAN_CHOICES = tuple(f"{i} - {label}" for i, (label, _) in enumerate(SPANS))
 
 # The top of the analyzer's band. The widest span starts at 0 and covers all of

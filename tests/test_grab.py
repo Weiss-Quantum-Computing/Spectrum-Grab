@@ -582,9 +582,21 @@ ok("... and the vector averaging is the third", "vector" in quality)
 
 print("\n--- capture_time ---")
 
-T_REC = S.record_time(11)                       # 1.0256 s at the 390 Hz span
-ok("the record length is bins/span", abs(T_REC - 400 / 390.0) < 1e-9,
-   f"{T_REC:.4f} s")
+T_REC = S.record_time(11)                       # 1.024 s at the 390 Hz span
+ok("the record length is bins/span", abs(T_REC - 400 / 390.625) < 1e-12,
+   f"{T_REC:.6f} s")
+# The label is the analyzer's printed one; the frequency is not. Every span is
+# the widest halved, exactly - the table used to carry the rounded display
+# figures and put 0.16 % into every record length costed from them.
+ok("the spans are exact halvings of 100 kHz",
+   all(hz == S.SPAN_TOP_HZ / 2.0 ** (19 - i)
+       for i, (_l, hz) in enumerate(S.SPANS)),
+   f"code 11 is {S.span_hz(11)}, code 13 is {S.span_hz(13)}")
+ok("... so the record lengths are round binary numbers of seconds",
+   T_REC == 1.024 and S.record_time(13) == 0.256,
+   f"{T_REC} and {S.record_time(13)}")
+ok("... and the labels still read as the analyzer prints them",
+   S.SPANS[11][0] == "390 Hz" and S.SPANS[13][0] == "1.56 kHz")
 # The figure the protocol was costed against, and the one plan_set computes:
 # settle + NAVG * T_rec + transfer, exact because the preset sets OVLP 0.
 plain = S.capture_time(11, navg=100, ovlp=0, settle_recs=5.0, transfer_s=1.5)
@@ -721,9 +733,14 @@ clear_log(app)
 app._grab_runs([""], [0.0, 1.0, 2.0], [11])
 root.update()
 log = logged(app)
+# Derived, not written out: the estimate moves with the span table and the
+# defaults, and a number typed in here only ever passes on the day it is typed.
+want = S.fmt_hms(3 * S.capture_time(11, navg=100, ovlp=0, settle_recs=5.0,
+                                    timeout_s=600.0,
+                                    transfer_s=S.TRANSFER_BINARY_S))
 ok("the sweep says what it will cost before it starts",
-   "about 5m28s of measuring" in log,
-   " ".join(log.split())[:88])
+   f"about {want} of measuring" in log,
+   f"wanted {want}: " + " ".join(log.split())[:74])
 ok("... and when it expects to finish", "finishing around" in log)
 ok("every run carries a countdown", log.count(" left, done ~") == 3)
 ok("the first is flagged as an estimate", "(estimated)" in log)
@@ -1390,14 +1407,15 @@ class OrderAn(FakeAn):
         FakeAn.__init__(self, {"OVLP": held} if readable else {})
 
 
-# SPANS stores the analyzer's own rounded display labels - 1560 Hz where the
-# instrument is really 1562.5 - so codes 11-13 come out 0.16 % off the exact
-# binary spans. That is immaterial everywhere record_time is used, but it means
-# these cannot be asserted to the last digit.
-MEASURED = {19: 0.0, 17: 0.0, 16: 50.0, 15: 75.0, 13: 93.75, 11: 98.44}
-ok("default_overlap reproduces every measured span default",
-   all(abs(S.default_overlap(c) - v) < 0.05 for c, v in MEASURED.items()),
-   str({c: round(S.default_overlap(c), 2) for c in MEASURED}))
+# These used to have to allow 0.05 % of slack, because SPANS carried the
+# manual's rounded display figures. With the exact spans they come out on the
+# nose - which is itself the evidence that the spans are exact halvings, since
+# 93.75 % is 1 - 0.016/0.256 and 0.256 s is 400 bins over 1562.5 Hz and nothing
+# else. 98.44 is the front panel's own rounding of 98.4375.
+MEASURED = {19: 0.0, 17: 0.0, 16: 50.0, 15: 75.0, 13: 93.75, 11: 98.4375}
+ok("default_overlap reproduces every measured span default exactly",
+   all(S.default_overlap(c) == v for c, v in MEASURED.items()),
+   str({c: S.default_overlap(c) for c in MEASURED}))
 
 ok("... and clamps to zero once the record is already past 16 ms",
    S.default_overlap(19) == 0.0 and S.default_overlap(17) == 0.0
@@ -1488,6 +1506,76 @@ app.set_name.set("dark against light, run 3, long label")
 app.refresh_hold()
 ok("an armed hold with a long set name leaves the width alone",
    width() == rest, f"{width()} vs {rest}")
+
+
+# The panel used to be a flat 1180x950 while the settings column asked for 990,
+# so Read and Apply sat 7 px inside the bottom edge and anything that grew the
+# column pushed them out of reach - which is what the averaging read-out did.
+# Measured as "does the window hold what the panel asks for", because a
+# withdrawn window has no rooty worth reading.
+def window_h():
+    root.update_idletasks()
+    return int(root.geometry().split("+")[0].split("x")[1])
+
+
+ok("the window is as tall as the panel asks for",
+   window_h() >= root.winfo_reqheight(),
+   f"window {window_h()}, panel wants {root.winfo_reqheight()}")
+
+# The read-out is pinned, so gaining its third line cannot push anything out.
+sizes, heights = set(), set()
+for state in ({"AVGO": "On", "AVGT": "RMS", "AVGM": "Linear", "NAVG": "100",
+               "OVLP": "0"}, {"NAVG": "400", "OVLP": "98.4375"},
+              {"AVGO": "Off"}):
+    for k, v in state.items():
+        app.set_vars[k].set(v)
+    root.update_idletasks()
+    sizes.add(app.avg_worth.master.winfo_reqheight())
+    heights.add(root.winfo_reqheight())
+# pack_propagate, not grid_propagate: the frame is placed with grid but its
+# label packs inside it, and with the wrong one the box grew 18 -> 46 px.
+ok("the read-out box is one size whatever it says", sizes == {sg.AVG_BOX_H},
+   str(sorted(sizes)))
+ok("... so the panel never asks for more room", len(heights) == 1,
+   str(heights))
+ok("... and the window still holds it",
+   window_h() >= root.winfo_reqheight(),
+   f"window {window_h()}, panel wants {root.winfo_reqheight()}")
+root.destroy()
+
+
+print("\n--- the panel that is left ---")
+
+root, app = build_app()
+# Two preset blocks to choose between, one of them a reproduction of how the old
+# data was taken, made every session open with a question about which discipline
+# was in force. The panel already shows every setting and marks the ones that
+# differ from the analyzer.
+ok("Stage preset and its dropdown are gone",
+   not hasattr(app, "preset") and not hasattr(app, "do_defaults"))
+ok("... but the library still has the presets for the protocol runner",
+   "protocol" in S.PRESETS and "legacy" in S.PRESETS)
+# The box gates write_plot and nothing else - the preview and the zoom window
+# are drawn whether or not it is ticked - so it is named for what it writes.
+def labels(widget, out=None):
+    """Every checkbutton label in the panel, wherever it is nested."""
+    out = [] if out is None else out
+    for w in widget.winfo_children():
+        if w.winfo_class() in ("TCheckbutton", "Checkbutton"):
+            try:
+                out.append(str(w.cget("text")))
+            except Exception:
+                pass
+        labels(w, out)
+    return out
+
+
+boxes = labels(root)
+ok("the plot box is called png, like the csv one next to it",
+   "png" in boxes and "plot" not in boxes,
+   str([b for b in boxes if b in ("csv", "png", "plot", "metadata")]))
+ok("... alongside the csv and metadata boxes it sits with",
+   {"csv", "metadata"} <= set(boxes))
 root.destroy()
 
 # --------------------------------- 13. what the averaging is actually worth
@@ -1549,27 +1637,47 @@ def worth(**kw):
     return app.avg_worth.cget("text")
 
 
+def flat(text):
+    return " ".join(text.split())
+
+
 text = worth(AVGO="On", AVGT="RMS", AVGM="Linear", NAVG="100", OVLP="0")
-ok("no overlap reads back as all of NAVG", "= 100.0 independent" in text, text)
-ok("... with its error bar", "1 sigma 0.1" in text and "0.41 dB" in text, text)
-ok("... and no warning", "overstates" not in text)
+ok("no overlap reads back as all of NAVG", "worth all 100 records" in text,
+   flat(text))
+ok("... with its error bar", "1 sigma 0.1 (0.41 dB)" in text, flat(text))
 
 text = worth(NAVG="400", OVLP="98.4375")
-ok("span 11's default overlap is priced", "7.2 independent" in text, text)
-ok("... and called out", "overstates the statistics 55x" in text, text)
-ok("... naming what puts it there", "SPAN sets this overlap" in text)
+# "7.23 of 400" says what the overlap ate more plainly than a multiplier, and
+# it fits two lines - a third was drawn 8 px past the bottom of the cell.
+ok("span 11's default overlap is priced against what was asked for",
+   "worth 7.23 of 400 records" in text, flat(text))
+ok("... with the bar that goes with it", "1 sigma 0.372 (1.37 dB)" in text,
+   flat(text))
 
 text = worth(NAVG="300", OVLP="93.75")
-ok("the 26 Aug legacy setting reads 19.7", "19.7 independent" in text, text)
+ok("the 26 Aug legacy setting reads 19.7 of 300",
+   "worth 19.7 of 300 records" in text, flat(text))
 
 ok("exponential has no count to state",
    "no definite depth" in worth(AVGM="Exponential"))
 ok("vector is not noise averaging",
-   "only RMS" in worth(AVGM="Linear", AVGT="Vector"))
+   "not noise averaging" in worth(AVGM="Linear", AVGT="Vector"))
 ok("averaging off is one record",
    "one record" in worth(AVGT="RMS", AVGO="Off"))
 ok("an empty box asks rather than guesses",
-   "set the number" in worth(AVGO="On", NAVG=""))
+   "set a number" in worth(AVGO="On", NAVG=""))
+# It has to fit the cell the Averaging group leaves empty - three short lines,
+# not the strip underneath that pushed Read and Apply off the panel.
+for state in ({"NAVG": "400", "OVLP": "98.4375"}, {"NAVG": "100", "OVLP": "0"},
+              {"AVGO": "Off"}, {"AVGO": "On", "AVGM": "Exponential"}):
+    t = worth(**state)
+    root.update_idletasks()
+    # Not "is it short enough" but "does Tk draw it inside the box" - three
+    # lines passed a character count and were still clipped by 8 px.
+    ok(f"{flat(t)[:30]!r} is drawn inside the cell",
+       app.avg_worth.winfo_reqheight() <= sg.AVG_BOX_H,
+       f"{len(t.splitlines())} lines wanting "
+       f"{app.avg_worth.winfo_reqheight()}px of {sg.AVG_BOX_H}")
 # It is a label that changes on every keystroke, so it gets the same treatment
 # as the preview caption.
 worth(NAVG="400", OVLP="98.4375")
@@ -1618,8 +1726,11 @@ widths = []
 for n in files:
     r = np.loadtxt(os.path.join(out, n), delimiter=",", skiprows=1)
     first = r[r[:, 2] == 1]
-    widths.append(round(first[:, 0].max() - first[:, 0].min()))
-ok("... and each holds one resolution", widths == [390, 6250], str(widths))
+    widths.append(first[:, 0].max() - first[:, 0].min())
+ok("... and each holds one resolution",
+   [round(w, 6) for w in widths] == [S.span_hz(11), S.span_hz(15)],
+   f"{[round(w, 4) for w in widths]} vs spans "
+   f"{[S.span_hz(11), S.span_hz(15)]}")
 
 files, _ = sweep_files(["dark", "light"], [0.0], [11, 15])
 ok("a case and a span both split", len(files) == 4, str(files))

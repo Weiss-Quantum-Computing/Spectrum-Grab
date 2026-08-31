@@ -101,9 +101,12 @@ change here lands there with no import error to warn you. That repo's
 
 ## Presets
 
-**Stage preset** puts a whole block in the panel without sending it, so it can
-be looked over before Apply. Two presets, because one block cannot be both a
-reproduction of history and a statement of current discipline:
+**These are library blocks, not a panel button.** Stage preset used to offer a
+choice between them, which made every session open with a question about which
+discipline was in force - and the settings panel already shows every value and
+marks the ones that differ from the analyzer, which is the same information
+without the choice. `sr760.PRESETS` stays for the protocol runner, which
+applies one by name because a script has no panel to read.
 
 - **legacy** - byte-identical to what the `read_sr760fft_data` bench scripts set
   at the top of every run, `ARNG:1` and `NAVG:1000` included. This is what the
@@ -293,16 +296,18 @@ without asking.
 
 ### What the averaging is worth
 
-Under the Averaging block is a line with nothing to fill in. It reads the
-**Number** and **Overlap (%)** boxes as you type them — before Apply — and says
-what they buy:
+The Averaging block has five settings laid out two to a row, which leaves one
+cell of the grid empty. That cell holds a read-out with nothing to fill in: it
+reads the **Number** and **Overlap (%)** boxes as you type them — before Apply —
+and says what they buy.
 
 ```
-100 averages at 0% overlap = 100.0 independent records, 1 sigma 0.1 (0.41 dB)
-
-400 averages at 98.4375% overlap = 7.2 independent records, 1 sigma 0.372 (1.37 dB)
-NAVG overstates the statistics 55x - SPAN sets this overlap unless it is re-asserted
+worth all 100 records          worth 7.23 of 400 records
+1 sigma 0.1 (0.41 dB)          1 sigma 0.372 (1.37 dB)
 ```
+
+`7.23 of 400` says what the overlap ate more plainly than a multiplier would,
+and the line turns amber past 1.5x.
 
 NAVG counts records the analyzer averaged, not independent ones. Records that
 overlap share samples, so `N` of them are worth `1 + (N-1)(1 - overlap)` — the
@@ -310,12 +315,29 @@ same count `record_stats` arrives at from the clock afterwards, and the same one
 the sweep's time estimate is built on. At `OVLP 0` it is just `N`, which is one
 more thing the `protocol` preset buys.
 
-It matters because **SPAN reinstalls its own default overlap**, up to 98.44% at
-the narrow end, so NAVG can be honoured to the letter while the trace is worth a
-fifty-fifth of it. The box turns amber when NAVG overstates by more than 1.5x,
-which is the threshold the metadata file uses too. It also names the cases where
-there is no count to state at all: averaging off, exponential mode, and vector
-or peak-hold averaging.
+It matters because **SPAN reinstalls its own default overlap**, up to 98.4375%
+at the narrow end, so NAVG can be honoured to the letter while the trace is
+worth a fifty-fifth of it. 1.5x is the threshold the metadata file uses too. The
+read-out also names the cases where there is no count to state at all: averaging
+off, exponential mode, and vector or peak-hold averaging.
+
+## The span table is exact
+
+`SPANS` carries the analyzer's printed **labels** and its true **frequencies**,
+which are not the same thing. Every span is 100 kHz halved: code 11 is 390.625
+Hz where the front panel says 390, and code 13 is 1562.5 Hz where it says
+1.56 kHz. The table used to hold the printed figures, which put 0.16% into every
+record length and into everything costed from one — settles, run estimates,
+independent-record counts.
+
+The measured default overlaps are the proof: exactly 93.75% at code 13 and
+98.4375% at code 11. Those are `1 - 0.016/T_rec` for record lengths of 0.256 s
+and 1.024 s, which are 400 bins over 1562.5 Hz and 390.625 Hz and nothing else.
+With the rounded table they came out 93.76 and 98.44.
+
+`run_protocol.py` keeps its own copy of the table, because the planner has to
+cost a session on a machine with no instrument code; `check_span_table()`
+reconciles the two whenever `sr760` is importable.
 
 To change something, edit the field and press **Apply changes**:
 
@@ -328,10 +350,6 @@ To change something, edit the field and press **Apply changes**:
   analyzer accepted rather than what you asked for.
 - The error status byte is read after every apply and anything non-zero is
   logged.
-
-**Stage preset** stages one of the two presets - see [Presets](#presets).
-Nothing is sent until you press Apply, so you can look the whole block over
-first.
 
 **Auto-offset** and **Auto-scale** send `AOFF` and `AUTS 0`. Auto offset runs
 on the analyzer for several seconds with the bus ignored, so the panel read that
@@ -595,12 +613,12 @@ the next segment starts one bin past the last point of the previous one.
 
 The bin spacing is read from the analyzer (`BVAL?` at both ends of the trace,
 divided by the 399 intervals between them) rather than derived from the span
-table, for two reasons: the table holds the manual's printed values, which are
-rounded - 390 Hz for a span that is really 390.625 - and the error would
-accumulate into a visible misalignment over a long stitch; and measuring end to
-end rather than between two adjacent bins divides the analyzer's own printed
-rounding by 399. It is also the same spacing the frequency column of the CSV is
-built from, so the overlapping points land exactly on saved data.
+table. The table is exact now - every span is 100 kHz halved, and code 11 is
+390.625 Hz rather than the 390 the front panel prints - so that is no longer
+the reason. What is left is that measuring end to end rather than between two
+adjacent bins divides the analyzer's own printed rounding by 399, and that this
+is the same spacing the frequency column of the CSV is built from, so the
+overlapping points land exactly on saved data.
 
 Because the spacing comes from the instrument, Fill needs a connection, and it
 declines while the panel has a span change you have not applied yet - it would
