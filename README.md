@@ -75,6 +75,28 @@ indistinguishable from a panel one: `write_csv`, `metadata_text`, `safe_name`
 and `unique_base` all live there, so both produce the same names and the same
 metadata block.
 
+## Tests
+
+```
+python tests/test_grab.py
+```
+
+No GPIB and no instrument: a fake analyzer stands in for the SR760, and the
+panel is built for real - every widget, with Tk withdrawn - so `run_one`,
+`save_run` and `_grab_worker` are driven the way a bench session drives them.
+Nothing opens a VISA session or touches the saved config.
+
+Almost every check is a regression, and each names the wrong answer it used to
+give, because none of these failures looked like failures: a trace labelled
+`dBV` when the analyzer was on volts, an error bar five times too good, an
+overload line reading a confident `no` when half the status timed out. The
+analyzer never complains about any of it, so the test has to.
+
+`sr760.py` is loaded by path from the protocol runner in Trek-EOM-ILC, so a
+change here lands there with no import error to warn you. That repo's
+`tests/test_protocol_sr760.py` is the other half of this one, and its
+`tests/test_protocol.py` and `tests/test_rin.py` are worth running too.
+
 ## Presets
 
 **Stage preset** puts a whole block in the panel without sending it, so it can
