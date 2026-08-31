@@ -1576,11 +1576,15 @@ def metadata_text(an, snap, extra, command):
     lines.append("")
     lines.append("analyzer settings")
     for group, settings in SETTING_GROUPS:
+        # The header only goes in if something under it was read. A group whose
+        # settings all went dead used to leave a bare [Display] with nothing
+        # beneath it, which reads as though the analyzer answered and had
+        # nothing to say rather than as though it never answered.
+        rows = [(s, snap[s.key]) for s in settings if snap.get(s.key) is not None]
+        if not rows:
+            continue
         lines.append(f"  [{group}]")
-        for s in settings:
-            raw = snap.get(s.key)
-            if raw is None:
-                continue
+        for s, raw in rows:
             lines.append(f"    {s.label:<17}: {fmt_setting(s, raw):<14} "
                          f"({command(s.key, raw)})")
     return "\n".join(lines) + "\n"

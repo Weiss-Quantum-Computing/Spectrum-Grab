@@ -333,7 +333,57 @@ so an empty Sweep panel is a single grab at the current settings.
   `input("Press Enter to continue")`, for setting something up by hand between
   runs.
 
-The three nest: every case runs every start frequency at every span.
+The three nest: every case runs every start frequency at every span, and
+**RUN SWEEP** is what starts it.
+
+**GRAB one** and **RUN SWEEP** are separate buttons. GRAB one takes a single
+capture at whatever the analyzer is set to and does not read the sweep boxes at
+all; RUN SWEEP reads them and refuses if they are empty. They used to be one
+button whose behaviour depended on three boxes elsewhere on the panel, so a
+stitch left in them turned the next single capture into an eight-hour run.
+Space is still GRAB one, and **Auto-grab** takes single captures for the same
+reason — it sits under that button.
+
+### One set of files, not one per segment
+
+A sweep writes its output **once, for the whole sweep**:
+
+```
+<title>_sweep_<date>.csv          every segment, sorted into one curve
+<title>_sweep_<date>.txt          the settings, and a line per segment
+<title>_sweep_<date>_freqs.npy    shape [case][start frequency][span][bin]
+<title>_sweep_<date>_amps.npy     same shape
+<title>_sweep_<date>_axes.json    what each axis is
+<title>_sweep_<date>.png          every trace on one pair of axes
+```
+
+Six files. It used to write a CSV, a plot and a metadata file for *every
+segment* as well — a 65-segment stitch left 199 files behind, and all of it was
+in the combined output too.
+
+The combined CSV carries a third column saying which segment each point came
+from, so joining them loses nothing: the overlaps stay separable, and a
+two-column reader that ignores it still sees the stitch. A sweep with several
+**cases** gets one CSV per case, since those are different measurements.
+
+The combined `.txt` is what the per-segment ones used to be, minus the
+repetition. The settings block is written once — a sweep holds the analyzer
+still apart from the span and start frequency it is moving on purpose — and
+what varies goes in a table:
+
+```
+segments  (the settings above are as read after the last one)
+   #  case   span   start (Hz)   top (Hz)  meas (s)  N_indep  1 sigma  overload  quality
+   1  -        11            0        390    102.6    100.0      0.1   no        clean
+   2  -        11          390        780    102.6    100.0      0.1   no        clean
+```
+
+A segment the run flagged is quoted in full underneath, because the whole point
+of the flag is that nothing on the trace shows it.
+
+**keep per-segment files** puts the old behaviour back if you want a segment on
+its own — you get both sets. A single **GRAB one** is unaffected either way: it
+writes its own csv/plot/metadata as it always did.
 
 ### What it will cost
 
@@ -391,17 +441,9 @@ single grab is unaffected. The redraw is throttled to once every couple of
 seconds, because every trace so far is redrawn each time and a long sweep of
 short runs would otherwise spend its time drawing rather than measuring.
 
-A sweep of more than one run also writes
-
-```
-<title>_sweep_<date>_freqs.npy    shape [case][start frequency][span][bin]
-<title>_sweep_<date>_amps.npy     same shape
-<title>_sweep_<date>_axes.json    what each axis is
-<title>_sweep_<date>.png          every trace on one pair of axes
-```
-
-which is the `freqs_matrix` / `amps_matrix` pair from the scripts, with the axis
-values written down next to it instead of living in a comment.
+The `.npy` pair in that set is the `freqs_matrix` / `amps_matrix` from the
+scripts, with the axis values written down next to it instead of living in a
+comment.
 
 **Stop** writes all of that too. A sweep cut short is written up exactly as a
 finished one - same file names, the combined plot of the segments captured so

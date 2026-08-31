@@ -420,7 +420,7 @@ class App:
     def build_grab(self, parent, pad):
         f = ttk.Frame(parent)
         f.pack(fill="x", **pad)
-        self.grab_btn = ttk.Button(f, text="GRAB  (or press Space)",
+        self.grab_btn = ttk.Button(f, text="GRAB one  (or press Space)",
                                    command=self.do_grab, state="disabled")
         self.grab_btn.pack(side="left", fill="x", expand=True, ipady=8)
         self.avg_btn = ttk.Button(f, text="Start average", width=14,
@@ -481,6 +481,12 @@ class App:
                    command=self.do_stitch).pack(side="left", padx=8)
 
         row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=(4, 2))
+        self.sweep_btn = ttk.Button(row, text="RUN SWEEP",
+                                    command=self.do_sweep, state="disabled")
+        self.sweep_btn.pack(side="left", fill="x", expand=True, ipady=6)
+
+        row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=(2, 6))
         self.save_npy = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="save .npy matrices",
@@ -491,6 +497,12 @@ class App:
         self.pause_cases = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="pause before each case",
                         variable=self.pause_cases).pack(side="left")
+        # A sweep writes its segments as one set of files, not as one set per
+        # segment - 65 segments used to leave 195 files behind. This puts the
+        # old behaviour back for anyone who wants a segment on its own.
+        self.keep_segments = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="keep per-segment files",
+                        variable=self.keep_segments).pack(side="left", padx=10)
 
     def build_options(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Acquisition")
@@ -740,9 +752,9 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or not self.an.inst else "normal"
-        for btn in (self.grab_btn, self.avg_btn, self.peek_btn, self.read_btn,
-                    self.apply_btn, self.aoff_btn, self.auts_btn,
-                    self.arng_chk, self.arm_btn, self.pin_btn):
+        for btn in (self.grab_btn, self.sweep_btn, self.avg_btn, self.peek_btn,
+                    self.read_btn, self.apply_btn, self.aoff_btn,
+                    self.auts_btn, self.arng_chk, self.arm_btn, self.pin_btn):
             btn.configure(state=state)
         self.refresh_hold()
         self.refresh_compare()
@@ -1604,8 +1616,25 @@ class App:
             self.root.after(0, lambda: self.set_busy(False))
 
     def do_grab(self):
+        """One capture, at whatever the analyzer is set to.
+
+        The sweep boxes are not read. They used to be - GRAB swept if they
+        happened to be filled in and took a single capture if they were not -
+        so what the button did depended on the contents of three boxes
+        somewhere else on the panel, and a stitch left in them turned the next
+        single capture into an eight-hour run. RUN SWEEP is the other one.
+        """
         if self.busy or not self.an.inst:
             return
+        self.abort.clear()
+        self.set_busy(True)
+        threading.Thread(target=self._grab_worker,
+                         args=([""], [None], [None]), daemon=True).start()
+
+    def sweep_lists(self):
+        """The sweep boxes as (cases, starts, spans), or None if they will not
+        parse. Empty lists stay empty here - the caller decides what that
+        means, which is 'nothing to sweep' for RUN SWEEP."""
         try:
             spans = [int(round(v)) for v in parse_list(self.spans_txt.get())]
             for code in spans:
@@ -1614,8 +1643,23 @@ class App:
             starts = parse_list(self.starts_txt.get())
         except ValueError as exc:
             self.log(f"Sweep list: {exc}")
-            return
+            return None
         cases = [c.strip() for c in self.cases_txt.get().split(",") if c.strip()]
+        return cases, starts, spans
+
+    def do_sweep(self):
+        """Every case, at every start frequency, at every span."""
+        if self.busy or not self.an.inst:
+            return
+        lists = self.sweep_lists()
+        if lists is None:
+            return
+        cases, starts, spans = lists
+        if not (cases or starts or spans):
+            self.log("Nothing to sweep: fill in span codes, start frequencies "
+                     "or cases first. GRAB one takes a single capture at the "
+                     "current settings.")
+            return
         self.abort.clear()
         self.set_busy(True)
         threading.Thread(target=self._grab_worker,
@@ -1659,7 +1703,15 @@ class App:
         freqs_m = np.full((len(cases), len(starts), len(spans), N_BINS), np.nan)
         amps_m = np.full_like(freqs_m, np.nan)
         done = []
+        # What each segment was measured under, kept so the sweep can describe
+        # itself once instead of leaving a .txt beside every trace.
+        records = []
         ended = ""
+        # A sweep writes one set of files for the whole thing. 65 segments used
+        # to leave 195 behind, and every one of them is in the combined output
+        # too - the same trace, the same settings, a folder that takes a
+        # scroll to read. A single capture is still a single capture.
+        segments = total == 1 or self.keep_segments.get()
         # The y axis the combined plot will carry, taken from the snapshot of
         # the last run that actually happened rather than from self.last_ylabel:
         # that is updated on the main thread through after(0, ...) and this runs
@@ -1674,11 +1726,12 @@ class App:
         t_sweep = time.perf_counter()
         paused_s = 0.0
         plan = []
-        # Whether the window follows the combined plot as it builds rather than
-        # flashing through each segment on its own. Off for a single grab, which
-        # has nothing to build, and off when the combined plot is not wanted at
-        # all - that tick box is the same answer to the same question.
-        building = total > 1 and self.combined.get() and Figure is not None
+        # Whether the window follows the combined plot as it builds. Off only
+        # for a single grab, which has nothing to build. Not tied to the
+        # combined plot tick: that says whether to SAVE the picture, and now
+        # that a sweep no longer writes a plot per segment, letting it decide
+        # the live view as well would leave the window blank for the whole run.
+        building = total > 1 and Figure is not None
         self.last_progress = 0.0
 
         try:
@@ -1741,8 +1794,14 @@ class App:
                         sweep_ylabel = trace_units(snap)
                         sweep_yscale = trace_yscale(snap)
                         done.append((freqs, amps, label or self.safe_title()))
-                        self.save_run(outdir, stamp, case, freqs, amps, snap,
-                                      notes, show=not building)
+                        records.append({"case": case, "span": code_of(snap,
+                                                                      "SPAN"),
+                                        "freqs": freqs, "amps": amps,
+                                        "snap": snap, "notes": notes,
+                                        "units": sweep_ylabel})
+                        if segments:
+                            self.save_run(outdir, stamp, case, freqs, amps,
+                                          snap, notes, show=not building)
                         if building:
                             self.show_sweep_so_far(done, total, sweep_ylabel,
                                                    sweep_yscale)
@@ -1767,7 +1826,7 @@ class App:
             if done and total > 1:
                 self.save_sweep(outdir, stamp, cases, starts, spans,
                                 freqs_m, amps_m, done, total, ended,
-                                sweep_ylabel, sweep_yscale)
+                                sweep_ylabel, sweep_yscale, records)
         except Exception as exc:
             self.log(f"ERROR: the sweep files could not be written: {exc}")
 
@@ -2191,8 +2250,89 @@ class App:
             d, n, planned))
         return True
 
+    def write_sweep_csv(self, base, records, cases, ylabel):
+        """The sweep's traces as one CSV per case, sorted into one curve.
+
+        A case is a different measurement, so it gets its own file; within one,
+        the segments are what a stitch is made of and belong on one axis. The
+        third column says which segment each point came from, so nothing is
+        lost by joining them - the overlaps stay separable, and a two-column
+        reader that ignores it still sees the stitch.
+        """
+        written = []
+        for case in cases:
+            rows = [r for r in records if r["case"] == case]
+            if not rows:
+                continue
+            freqs = np.concatenate([r["freqs"] for r in rows])
+            amps = np.concatenate([r["amps"] for r in rows])
+            seg = np.concatenate([np.full(len(r["freqs"]), i, dtype=float)
+                                  for i, r in enumerate(rows, 1)])
+            order = np.argsort(freqs, kind="stable")
+            path = base + (f"_{safe_name(case)}.csv" if case else ".csv")
+            np.savetxt(path, np.column_stack([freqs[order], amps[order],
+                                              seg[order]]),
+                       delimiter=",", comments="",
+                       header=f"Frequency (Hz),{safe_name(ylabel)},segment")
+            written.append((path, len(rows)))
+        return written
+
+    def sweep_metadata_text(self, records, cases, starts, spans, planned,
+                            ended, ylabel):
+        """The whole sweep described once.
+
+        Everything the per-segment files used to carry, minus the repetition.
+        The settings block is written once, because a sweep holds the analyzer
+        still apart from the span and the start frequency it is moving on
+        purpose; what varies goes in a table, one line a segment. A segment the
+        run flagged is quoted in full underneath, because the whole point of
+        the flag is that nothing on the trace shows it.
+        """
+        freqs = np.concatenate([r["freqs"] for r in records])
+        extra = {
+            "sweep": f"{len(cases)} case(s) x {len(starts)} start freq(s) x "
+                     f"{len(spans)} span(s) = {planned} runs",
+            "runs completed": str(len(records)),
+            "ended early": ended or "-",
+            "trace units": ylabel,
+            "frequency range (Hz)": f"{np.min(freqs):g} to {np.max(freqs):g}",
+            "bins per segment": str(N_BINS),
+        }
+        scales = sorted({r["units"] for r in records})
+        if len(scales) > 1:
+            extra["UNITS CHANGED"] = (f"{', '.join(scales)} - the segments are "
+                                      f"not all on one scale")
+        head = metadata_text(self.an, records[-1]["snap"], extra, self.command)
+
+        table = ["", "segments  (the settings above are as read after the last "
+                     "one)",
+                 f"  {'#':>4}  {'case':<12} {'span':>4} {'start (Hz)':>12} "
+                 f"{'top (Hz)':>12} {'meas (s)':>9} {'N_indep':>8} "
+                 f"{'1 sigma':>8}  {'overload':<10} quality"]
+        suspect = []
+        for case in cases:
+            for i, r in enumerate([x for x in records if x["case"] == case], 1):
+                n = r["notes"]
+                quality = n.get("trace quality", "")
+                table.append(
+                    f"  {i:>4}  {(case or '-'):<12} "
+                    f"{('?' if r['span'] is None else r['span']):>4} "
+                    f"{float(r['freqs'][0]):>12.6g} "
+                    f"{float(r['freqs'][-1]):>12.6g} "
+                    f"{n.get('measure time (s)', '?'):>9} "
+                    f"{n.get('independent records', '?'):>8} "
+                    f"{n.get('relative error (1 sigma)', '?'):>8}  "
+                    f"{n.get('overload', '?'):<10} "
+                    f"{'SUSPECT' if quality.startswith('SUSPECT') else 'clean'}")
+                if quality.startswith("SUSPECT"):
+                    suspect.append(f"  {(case or '-')} #{i}: {quality}")
+        if suspect:
+            table += ["", "suspect segments"] + suspect
+        return head + "\n".join(table) + "\n"
+
     def save_sweep(self, outdir, stamp, cases, starts, spans, freqs_m, amps_m,
-                   done, planned, ended="", ylabel=None, yscale=None):
+                   done, planned, ended="", ylabel=None, yscale=None,
+                   records=()):
         """The whole sweep in one place: the raw matrices, a JSON note of what
         each axis means, and every trace on one pair of axes.
 
@@ -2201,8 +2341,22 @@ class App:
         segments it did capture. What is missing says so - unmeasured cells stay
         NaN, the JSON counts the runs, and the plot title carries the shortfall
         rather than passing a partial sweep off as a whole one."""
+        ylabel = self.last_ylabel if ylabel is None else ylabel
+        # Every name the sweep might write, so the whole set shares one stem
+        # even when only some of them are ticked - the same rule save_run had
+        # to be taught, for the same reason.
+        suffixes = ["_freqs.npy", "_amps.npy", "_axes.json", ".png", ".txt"]
+        suffixes += [f"_{safe_name(c)}.csv" if c else ".csv" for c in cases]
         base = unique_base(outdir, f"{self.safe_title()}_sweep_{stamp}",
-                           ["_freqs.npy", "_amps.npy", "_axes.json", ".png"])
+                           suffixes)
+        if records and self.save_csv.get():
+            for path, n in self.write_sweep_csv(base, records, cases, ylabel):
+                self.log(f"  {os.path.basename(path)}  ({n} segments)")
+        if records and self.save_txt.get():
+            with open(base + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(self.sweep_metadata_text(records, cases, starts, spans,
+                                                  planned, ended, ylabel))
+            self.log(f"  {os.path.basename(base)}.txt")
         if self.save_npy.get():
             np.save(base + "_freqs.npy", freqs_m)
             np.save(base + "_amps.npy", amps_m)
@@ -2235,8 +2389,7 @@ class App:
                  + (f" - {ended}" if ended else ""),
                  datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
             self.write_plot(base + ".png", done, self.plot_title(note="sweep"),
-                            subtitle,
-                            self.last_ylabel if ylabel is None else ylabel,
+                            subtitle, ylabel,
                             self.last_yscale if yscale is None else yscale)
 
     # -- settings panel ---------------------------------------------------

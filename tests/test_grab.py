@@ -753,12 +753,10 @@ ok("the finished combined plot is what is left on screen",
 ok("the zoom window has every trace to redraw from", len(plot[0]) == 4,
    f"{len(plot[0])} traces")
 
-# The per-run PNGs are still written; they just do not take over the preview.
+# A sweep leaves one plot behind, not one per segment.
 pngs = sorted(n for n in os.listdir(out) if n.endswith(".png"))
-ok("every run still wrote its own plot", len(pngs) == 5, str(len(pngs)))
-ok("... alongside the one combined plot",
-   sum("_sweep_" in n for n in pngs) == 1, str([n for n in pngs
-                                                if "_sweep_" in n]))
+ok("a four-run sweep writes one plot, not four", len(pngs) == 1, str(pngs))
+ok("... and it is the combined one", "_sweep_" in pngs[0], pngs[0])
 
 print("\n--- and only when there is something to build ---")
 
@@ -771,9 +769,13 @@ ok("a single grab still shows its own plot",
 out = os.path.join(TMP, "nocombined")
 os.makedirs(out, exist_ok=True)
 shown, _, _ = sweep_into(out, [0.0, 1.0, 2.0], combined=False)
-ok("with the combined plot unticked the segments show instead",
-   all(s[0] == "saved" for s in shown) and len(shown) == 3,
-   str([s[0] for s in shown]))
+# The tick says whether to SAVE the combined plot. It used to decide the live
+# view too, which was harmless while a sweep still drew every segment - now
+# that it does not, that would have left the window blank for the whole run.
+ok("unticking the combined plot still lets you watch it build",
+   [s[0] for s in shown] == ["building"] * 3, str([s[0] for s in shown]))
+ok("... it just does not save the picture",
+   not any(n.endswith(".png") for n in os.listdir(out)), str(os.listdir(out)))
 
 out = os.path.join(TMP, "nopng")
 os.makedirs(out, exist_ok=True)
@@ -782,9 +784,197 @@ ok("the building plot does not need the per-run PNGs to be saved",
    [s[0] for s in shown[:3]] == ["building"] * 3,
    str([s[0] for s in shown]))
 ok("... and nothing but the combined plot is written",
-   sorted(n for n in os.listdir(out) if n.endswith(".png")) == []
-   or all("_sweep_" in n for n in os.listdir(out) if n.endswith(".png")),
+   all("_sweep_" in n for n in os.listdir(out) if n.endswith(".png")),
    str(os.listdir(out)))
+
+
+# ------------------------------------- 9b. one set of files, not one per run
+
+print("\n--- GRAB one and RUN SWEEP are different buttons ---")
+
+out = os.path.join(TMP, "split")
+os.makedirs(out, exist_ok=True)
+root, app = build_app(outdir=out)
+app.save_png.set(False), app.save_npy.set(False), app.combined.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+started = []
+app._grab_worker = lambda cases, starts, spans: started.append(
+    (cases, starts, spans))
+
+
+class RunNow:
+    """A Thread that runs on the spot, so what a button did is settled by the
+    time the next line looks."""
+
+    def __init__(self, target=None, args=(), daemon=None, **kw):
+        self.target, self.args = target, args
+
+    def start(self):
+        self.target(*self.args)
+
+
+real_thread, sg.threading.Thread = sg.threading.Thread, RunNow
+
+
+def press(action):
+    """The stub _grab_worker never reaches the real one's finally, so busy has
+    to be let go by hand between presses."""
+    app.busy = False
+    started.clear()
+    clear_log(app)
+    action()
+    return list(started)
+
+# Was: one button, and what it did depended on three boxes elsewhere on the
+# panel - a stitch left in them turned the next single capture into an
+# eight-hour run.
+app.spans_txt.set("11, 12")
+app.starts_txt.set("0, 390, 780")
+app.cases_txt.set("dark, light")
+ok("GRAB one takes one capture whatever is in the sweep boxes",
+   press(app.do_grab) == [([""], [None], [None])], str(started))
+ok("RUN SWEEP reads them",
+   press(app.do_sweep) == [(["dark", "light"], [0.0, 390.0, 780.0], [11, 12])],
+   str(started))
+
+app.spans_txt.set(""), app.starts_txt.set(""), app.cases_txt.set("")
+ok("RUN SWEEP with nothing in the boxes refuses", press(app.do_sweep) == [])
+ok("... and says which button takes a single capture",
+   "GRAB one" in logged(app), " ".join(logged(app).split())[:78])
+ok("GRAB one still works with the boxes empty",
+   press(app.do_grab) == [([""], [None], [None])])
+
+app.spans_txt.set("99")
+ok("a span code out of range is still caught", press(app.do_sweep) == [])
+ok("... and named", "not in 0-19" in logged(app),
+   " ".join(logged(app).split())[:60])
+app.spans_txt.set("")
+
+# Auto-grab sits under GRAB one, so that is what it does. It used to sweep if
+# the boxes happened to be filled.
+app.starts_txt.set("0, 390")
+app.busy = False
+started.clear()
+app.schedule_auto()
+if app.auto_job is not None:
+    root.after_cancel(app.auto_job)
+    app.auto_job = None
+ok("auto-grab takes single captures, not sweeps",
+   started == [([""], [None], [None])], str(started))
+sg.threading.Thread = real_thread
+del app._grab_worker
+root.destroy()
+
+
+print("\n--- a sweep leaves one set of files ---")
+
+
+def run_sweep(outdir, starts, cases=None, keep=False, spans=None):
+    root, app = build_app(outdir=outdir)
+    for var in (app.save_csv, app.save_png, app.save_txt, app.save_npy,
+                app.combined):
+        var.set(True)
+    app.keep_segments.set(keep)
+    app.lock.set(False), app.pause_cases.set(False)
+    if cases:
+        app.cases_txt.set(", ".join(cases))
+    app._grab_runs(cases or [""], starts, spans or [11])
+    root.update()
+    log = logged(app)
+    root.destroy()
+    return sorted(os.listdir(outdir)), log
+
+
+out = os.path.join(TMP, "onefileset")
+os.makedirs(out, exist_ok=True)
+files, log = run_sweep(out, [0.0, 1.0, 2.0, 3.0])
+# Was: four segments left twelve files - a csv, a png and a txt each - and the
+# combined set on top, all of it the same four traces written twice.
+ok("four segments leave one set of files, not four", len(files) == 6,
+   str(files))
+ok("... the traces, as one CSV", files.count("sr760_sweep_20260830.csv") == 1)
+ok("... the matrices and their axes",
+   sum(n.endswith((".npy", "_axes.json")) for n in files) == 3, str(files))
+ok("... one plot", sum(n.endswith(".png") for n in files) == 1)
+ok("... and one metadata file", sum(n.endswith(".txt") for n in files) == 1)
+ok("no per-segment file survives",
+   not any("_span" in n for n in files), str(files))
+
+print("\n--- but the combined CSV is the whole sweep ---")
+
+csv = os.path.join(out, "sr760_sweep_20260830.csv")
+rows = np.loadtxt(csv, delimiter=",", skiprows=1)
+ok("every point of every segment is in it", rows.shape == (4 * sg.N_BINS, 3),
+   str(rows.shape))
+ok("... sorted into one curve",
+   list(rows[:, 0]) == sorted(rows[:, 0]))
+ok("... with a column saying which segment each point came from",
+   sorted(set(rows[:, 2])) == [1.0, 2.0, 3.0, 4.0], str(sorted(set(rows[:, 2]))))
+header = open(csv, encoding="utf-8").readline().strip()
+ok("... and a header naming the scale", header.endswith("dBV_sqrtHz,segment"),
+   header)
+# The third column must not stop Compare reading it back.
+f, a, lab = S.read_csv(csv)
+ok("the compare loader reads it", len(f) == 4 * sg.N_BINS
+   and S.canonical_units(lab) == "dBV/sqrtHz", f"{len(f)}, {lab}")
+
+print("\n--- and the metadata describes every segment ---")
+
+meta = open(os.path.join(out, "sr760_sweep_20260830.txt"),
+            encoding="utf-8").read()
+ok("the sweep is described", "1 case(s) x 4 start freq(s)" in meta)
+ok("the runs are counted", "runs completed       : 4" in meta, )
+ok("the settings block is there once",
+   meta.count("analyzer settings") == 1)
+ok("there is a line per segment", meta.count("\n     1  ") == 1
+   and meta.count("\n     4  ") == 1)
+ok("each carries what varied",
+   "N_indep" in meta and "1 sigma" in meta and "overload" in meta)
+ok("the units are stated", "trace units" in meta)
+
+# A flagged segment has to be quoted, since nothing on the trace shows it.
+out2 = os.path.join(TMP, "suspect")
+os.makedirs(out2, exist_ok=True)
+root, app = build_app(snap=dict(GOOD, AVGT="1"), outdir=out2)
+for var in (app.save_csv, app.save_png, app.save_txt, app.save_npy,
+            app.combined):
+    var.set(True)
+app.keep_segments.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+app._grab_runs([""], [0.0, 1.0], [11])
+root.update()
+root.destroy()
+meta = open(os.path.join(out2, [n for n in os.listdir(out2)
+                                if n.endswith(".txt")][0]),
+            encoding="utf-8").read()
+ok("a flagged segment is listed as suspect", "suspect segments" in meta)
+ok("... and quoted in full", "vector averaging" in meta,
+   [l for l in meta.splitlines() if "vector" in l][0][:70])
+
+print("\n--- the old behaviour is one tick away ---")
+
+out = os.path.join(TMP, "keepthem")
+os.makedirs(out, exist_ok=True)
+files, _ = run_sweep(out, [0.0, 1.0, 2.0], keep=True)
+ok("keep per-segment files puts them back",
+   sum("_span" in n for n in files) == 9, str(sum("_span" in n for n in files)))
+ok("... and the combined set is still written alongside",
+   sum("_sweep_" in n for n in files) == 6, str(sorted(files)))
+ok("... which is 15 files for three segments, the old way",
+   len(files) == 15, str(len(files)))
+
+print("\n--- a case gets its own CSV ---")
+
+out = os.path.join(TMP, "cases")
+os.makedirs(out, exist_ok=True)
+files, _ = run_sweep(out, [0.0, 1.0], cases=["dark", "light"])
+csvs = sorted(n for n in files if n.endswith(".csv"))
+ok("one CSV per case", len(csvs) == 2, str(csvs))
+ok("... named for the case", all("dark" in n or "light" in n for n in csvs),
+   str(csvs))
+rows = np.loadtxt(os.path.join(out, csvs[0]), delimiter=",", skiprows=1)
+ok("... holding only that case's segments", rows.shape == (2 * sg.N_BINS, 3),
+   str(rows.shape))
 
 print("\n--- the redraw is throttled ---")
 
