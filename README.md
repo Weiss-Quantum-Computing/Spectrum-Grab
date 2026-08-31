@@ -385,6 +385,23 @@ of the flag is that nothing on the trace shows it.
 its own — you get both sets. A single **GRAB one** is unaffected either way: it
 writes its own csv/plot/metadata as it always did.
 
+### Folders taken before that
+
+```bash
+python tools/consolidate_sweep.py <folder> --apply
+```
+
+brings a folder written the old way up to the same shape: it builds the
+combined `.csv` and `.txt` from the per-segment files, checks the result reads
+back identically, and then **moves** the per-segment files into a `segments/`
+subfolder. It does not delete them, and the reason is that they are not
+redundant — the `.npy` matrices hold frequencies and amplitudes and nothing
+else, so the units, the input range, the averaging and the overlap each segment
+was taken under exist only in those `.txt` files. Once you have looked at what
+it produced, `segments/` is yours to remove.
+
+Without `--apply` it says what it would do and changes nothing.
+
 ### What it will cost
 
 A sweep of more than one run prices itself before it starts, and counts down as

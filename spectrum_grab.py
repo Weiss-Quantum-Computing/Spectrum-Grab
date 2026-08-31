@@ -117,6 +117,24 @@ DEFAULT_YMIN, DEFAULT_YMAX = -160.0, -20.0
 # Files
 # ---------------------------------------------------------------------------
 
+# Text that changes as the panel runs has to be kept to a length, because Tk
+# sizes a widget to fit its label and passes the request up to the window. A
+# capture's file name is sixty characters and used to move the whole panel 91 px
+# wider every time a grab finished, then back again on the next peek.
+CAPTION_CHARS = 58            # under the preview
+STATUS_CHARS = 64             # the connection, hold and compare lines
+
+
+def elide(text, width):
+    """Long text shortened from the middle, so both ends survive - which is
+    where a capture's name carries what it is and when it was taken."""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    keep = (width - 3) // 2
+    return f"{text[:keep]}...{text[-keep:]}"
+
+
 SUBTITLE_SEP = "   ·   "      # between items of the notes line under the title
 TITLE_WRAP = 58               # characters that fit across the figure at 15 pt
 SUBTITLE_WRAP = 74            # ... and at 9 pt
@@ -152,12 +170,17 @@ def sequence_label(path):
 
     The file names a run writes are <title>[_case]_spanNN[_strfF Hz]_<top>Hz_
     <date>, so the part before _span is what a set of segments has in common and
-    the part after is what tells them apart. The folder joins the key because
-    the same title measured on two days is two sequences, not one - which is
-    the usual comparison.
+    the part after is what tells them apart. A whole sweep writes
+    <title>_sweep_<date> instead, and that is cut at the same place - so one
+    sweep loaded from its combined CSV and the same sweep loaded from the
+    per-segment files it used to leave behind come out under one name, which is
+    what they are.
+
+    The folder joins the key because the same title measured on two days is two
+    sequences, not one - which is the usual comparison.
     """
     stem = os.path.splitext(os.path.basename(path))[0]
-    head = re.split(r"_span\d", stem, maxsplit=1)[0]
+    head = re.split(r"_span\d|_sweep_\d", stem, maxsplit=1)[0]
     if not head:
         head = stem
     day = os.path.basename(os.path.dirname(os.path.abspath(path)))
@@ -626,6 +649,11 @@ class App:
         self.logbox.pack(fill="both", expand=True, padx=4, pady=4)
 
     def build_preview(self, parent, pad):
+        # The frame's own label never changes. A LabelFrame asks for room to
+        # draw its label, and that request goes all the way up to the window, so
+        # a caption there is a caption that resizes the panel: "Last plot -
+        # <name>.png (double-click...)" is a hundred characters and moved
+        # everything 91 px sideways at the end of every grab.
         self.shot_frame = ttk.LabelFrame(parent, text="Last plot")
         self.shot_frame.pack(fill="x", **pad)
         box = tk.Frame(self.shot_frame, width=PREVIEW_W, height=PREVIEW_H)
@@ -636,6 +664,15 @@ class App:
         self.preview.bind("<Double-Button-1>", self.open_preview)
         self.preview_img = None
         self.preview_path = None
+
+        # The caption lives here instead, in a box of its own that cannot grow:
+        # pack_propagate(False) means whatever is written in it asks for nothing.
+        cap = tk.Frame(self.shot_frame, width=PREVIEW_W, height=20)
+        cap.pack(fill="x", padx=6)
+        cap.pack_propagate(False)
+        self.shot_caption = ttk.Label(cap, text="(no plot yet)", anchor="w",
+                                      foreground="#444")
+        self.shot_caption.pack(fill="both", expand=True)
 
         row = ttk.Frame(self.shot_frame)
         row.pack(fill="x", padx=6, pady=(0, 6))
@@ -809,13 +846,16 @@ class App:
         self.preview.configure(image=img, text="")
         return True
 
+    def set_caption(self, text):
+        """Main thread. What the preview is showing, in a label that cannot
+        resize the panel around it."""
+        self.shot_caption.configure(text=elide(text, CAPTION_CHARS))
+
     def show_preview(self, path):
         if not self.render_preview(path):
             return
         self.preview_path = path
-        self.shot_frame.configure(
-            text=f"Last plot - {os.path.basename(path)}  "
-                 f"(double-click to open full size)")
+        self.set_caption(os.path.basename(path))
 
     def show_peek(self, data):
         """A plot held only in the window. preview_path goes to None: there is
@@ -825,7 +865,7 @@ class App:
             return
         self.preview_path = None
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.shot_frame.configure(text=f"Peek at {stamp} - not saved")
+        self.set_caption(f"Peek at {stamp} - not saved")
 
     def show_building(self, data, done, planned):
         """The sweep as it stands, part way through. Same reasoning as the peek
@@ -835,8 +875,7 @@ class App:
         if not self.render_preview(data):
             return
         self.preview_path = None
-        self.shot_frame.configure(
-            text=f"Sweep building - {done} of {planned} runs")
+        self.set_caption(f"Sweep building - {done} of {planned} runs")
 
     # -- zoom window ------------------------------------------------------
 
@@ -1030,7 +1069,7 @@ class App:
             try:
                 idn = self.an.connect(self.addr.get().strip() or None)
                 self.root.after(0, lambda: self.status.configure(
-                    text=idn[:70], foreground="#060"))
+                    text=elide(idn, STATUS_CHARS), foreground="#060"))
                 self.log(f"Connected: {idn}")
                 self.log(f"Address:   {self.an.addr}")
                 self.root.after(0, lambda: self.addr.set(self.an.addr))
@@ -1304,9 +1343,9 @@ class App:
         name = self.set_name.get().strip()
         if held:
             self.hold_status.configure(
-                text=f"held at {self.pinned_range:g} dBV"
-                     + (f" for '{name}'" if name else "")
-                     + f", armed {self.pinned_at}",
+                text=elide(f"held at {self.pinned_range:g} dBV"
+                           + (f" for '{name}'" if name else "")
+                           + f", armed {self.pinned_at}", STATUS_CHARS),
                 foreground="#060")
         else:
             self.hold_status.configure(
@@ -1370,8 +1409,9 @@ class App:
         n = len(self.compare)
         if n:
             self.compare_status.configure(
-                text=f"{n} sequence(s): "
-                     + "; ".join(s["name"] for s in self.compare),
+                text=elide(f"{n} sequence(s): "
+                           + "; ".join(s["name"] for s in self.compare),
+                           STATUS_CHARS),
                 foreground="#060")
         else:
             self.compare_status.configure(text="nothing loaded",

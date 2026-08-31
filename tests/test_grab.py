@@ -1115,6 +1115,15 @@ ok("the name is what the segments share",
 ok("the folder is part of it - one title on two days is two sequences",
    sg.sequence_label(r"C:\d\20260826\a_span11_390Hz_x.csv")
    != sg.sequence_label(r"C:\d\20260830\a_span11_390Hz_x.csv"))
+# A sweep's own combined CSV and the per-segment files it used to leave behind
+# are the same measurement, so they have to come out under the same name.
+ok("a combined sweep CSV lands on the same name as its segments",
+   sg.sequence_label(r"C:\d\20260826\Trek X2_sweep_20260826.csv")
+   == sg.sequence_label(r"C:\d\20260826\Trek X2_span13_1559Hz_20260826.csv"),
+   sg.sequence_label(r"C:\d\20260826\Trek X2_sweep_20260826.csv"))
+ok("... and the date is not left in the name twice",
+   sg.sequence_label(r"C:\d\20260826\Trek X2_sweep_20260826.csv")
+   == "Trek X2  20260826")
 
 paths = sorted(glob.glob(os.path.join(out, "*.csv")))
 seqs = load_sequences(paths)
@@ -1399,6 +1408,59 @@ ok("... and the log says the span default was left in place",
 
 ok("the protocol preset still carries OVLP with no SPAN of its own",
    "OVLP" in S.PRESETS["protocol"] and "SPAN" not in S.PRESETS["protocol"])
+
+# ------------------------------------ 12. the panel stays the size it is
+
+print("\n--- the window does not move under changing text ---")
+
+ok("long text is shortened from the middle, keeping both ends",
+   sg.elide("abcdefghijklmnopqrstuvwxyz", 13) == "abcde...vwxyz",
+   sg.elide("abcdefghijklmnopqrstuvwxyz", 13))
+ok("short text is left alone", sg.elide("short", 40) == "short")
+
+root, app = build_app()
+root.update()
+
+
+def width():
+    root.update_idletasks()
+    return root.winfo_reqwidth()
+
+
+rest = width()
+# Was: the caption lived in the LabelFrame's own label, and a LabelFrame asks
+# for room to draw it. A capture's file name is sixty characters, so the panel
+# jumped 91 px wider at the end of every grab and back on the next peek.
+app.set_caption("Peek at 14:22:31 - not saved")
+ok("a peek leaves the width alone", width() == rest, f"{width()} vs {rest}")
+app.set_caption("Trek X2 mon no drive_span13_strf17015.6Hz_18574Hz_20260826.png")
+ok("a grab's file name leaves the width alone", width() == rest,
+   f"{width()} vs {rest}")
+ok("... and the name is still readable at both ends",
+   app.shot_caption.cget("text").startswith("Trek X2 mon no drive")
+   and app.shot_caption.cget("text").endswith("20260826.png"),
+   app.shot_caption.cget("text"))
+app.set_caption("Sweep building - 3 of 14 runs")
+ok("a building sweep leaves the width alone", width() == rest)
+
+app.compare = [{"name": "50 ohm full span grounded  20260830"},
+               {"name": "Trek X2 Monitor zero drive  20260826"},
+               {"name": "Trek X2 mon no drive  20260826"}]
+app.refresh_compare()
+ok("three loaded sequences leave the width alone", width() == rest,
+   f"{width()} vs {rest}")
+
+app.status.configure(text=sg.elide("Stanford_Research_Systems,SR760,s/n88214,"
+                                   "v1.60", sg.STATUS_CHARS))
+ok("connecting leaves the width alone", width() == rest)
+
+app.pinned_range = -30.0
+app.pinned_at = "2026-08-31 09:14:02"
+app.set_name.set("dark against light, run 3, long label")
+app.refresh_hold()
+ok("an armed hold with a long set name leaves the width alone",
+   width() == rest, f"{width()} vs {rest}")
+root.destroy()
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")
