@@ -25,6 +25,7 @@ import io
 import json
 import os
 import queue
+import re
 import textwrap
 import threading
 import time
@@ -44,11 +45,13 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    SETTING_GROUPS, SETTLE_KEYS, SPACE_OWNERS, SPAN_CHOICES,
                    SPANS, TRACE, TRANSFER_ASCII_S, TRANSFER_BINARY_S,
                    averaging_fault, binary_refusal, binary_valid, capture_time,
-                   code_of, fmt_hms, fmt_setting, hold_notes, label_of,
-                   metadata_text, parse_list, parse_setting, pretty_units,
-                   readout_fault, reads_in_db, record_stats, record_time,
-                   safe_name, span_hz, stats_notes, trace_units, trace_yscale,
-                   unique_base, write_csv)
+                   canonical_units, code_of, convert_amplitude, fmt_hms,
+                   fmt_setting, hold_notes, label_of, metadata_text,
+                   parse_list, parse_setting,
+                   pretty_units, read_csv, readout_fault, reads_in_db,
+                   record_stats, record_time, safe_name, span_hz, stats_notes,
+                   trace_units, trace_yscale, unique_base, unit_parts,
+                   write_csv)
 
 try:
     from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
@@ -136,8 +139,76 @@ def wrap_notes(bits, width=SUBTITLE_WRAP):
     return "\n".join(lines)
 
 
+# Greys for the reference sequences a comparison draws underneath. Grey rather
+# than colours: while a sweep builds, the colours belong to the segments being
+# measured, and a reference that competes with them for attention is worse than
+# no reference. Several levels so more than one reference stays tellable apart.
+REF_GREYS = ("#8c8c8c", "#5a5a5a", "#b4b4b4", "#3c3c3c")
+
+
+def sequence_label(path):
+    """The name a saved capture belongs under: everything before the _spanNN
+    part of the file name, plus the folder it sits in.
+
+    The file names a run writes are <title>[_case]_spanNN[_strfF Hz]_<top>Hz_
+    <date>, so the part before _span is what a set of segments has in common and
+    the part after is what tells them apart. The folder joins the key because
+    the same title measured on two days is two sequences, not one - which is
+    the usual comparison.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    head = re.split(r"_span\d", stem, maxsplit=1)[0]
+    if not head:
+        head = stem
+    day = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    return f"{head}  {day}" if day else head
+
+
+def load_sequences(paths, log=None):
+    """Saved CSVs grouped into sequences, ready to draw.
+
+    Returns [{name, freqs, amps, ylabel, segments, paths}], one entry per group,
+    with each group's segments concatenated and sorted into one curve - a stitch
+    is one measurement of one band, drawn as one line, however many captures it
+    took. Points are not merged where segments overlap; both are kept, which is
+    what makes a bad join visible rather than averaged away.
+
+    A segment whose units differ from the rest of its own group is dropped and
+    named, because there is no reading of that which is a single measurement.
+    """
+    say = log if log is not None else (lambda _msg: None)
+    groups = {}
+    for path in paths:
+        try:
+            freqs, amps, ylabel = read_csv(path)
+        except Exception as exc:
+            say(f"  ({os.path.basename(path)}: {exc})")
+            continue
+        # Back into the spelling trace_units() uses, so a sequence loaded off
+        # disk compares equal to a live capture in the same units instead of
+        # being "converted" from a scale to itself.
+        ylabel = canonical_units(ylabel)
+        groups.setdefault(sequence_label(path),
+                          []).append((path, freqs, amps, ylabel))
+    out = []
+    for name, parts in groups.items():
+        ylabel = parts[0][3]
+        kept = [p for p in parts if p[3] == ylabel]
+        if len(kept) != len(parts):
+            odd = sorted({p[3] or "(no header)" for p in parts if p[3] != ylabel})
+            say(f"  ({name}: dropped {len(parts) - len(kept)} segment(s) "
+                f"measured in {', '.join(odd)} rather than {ylabel})")
+        freqs = np.concatenate([p[1] for p in kept])
+        amps = np.concatenate([p[2] for p in kept])
+        order = np.argsort(freqs, kind="stable")
+        out.append({"name": name, "freqs": freqs[order], "amps": amps[order],
+                    "ylabel": ylabel, "segments": len(kept),
+                    "paths": [p[0] for p in kept]})
+    return sorted(out, key=lambda s: s["name"])
+
+
 def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
-                yscale="linear"):
+                yscale="linear", refs=()):
     """Draw one or more traces onto an existing axes.
 
     Titling is two lines: what the capture is, then the handful of settings that
@@ -146,17 +217,27 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
     a plot that looks unlike the others is flagged rather than silently
     rescaled. Linear traces are left to autoscale.
 
+    `refs` are sequences loaded off disk to compare against. They go on first,
+    in grey and behind, so the colours go on meaning the thing being measured -
+    a reference that competes with the live traces for attention is worse than
+    no reference. They count toward the y window like anything else, because a
+    comparison whose reference falls off the top of the plot is not one.
+
     Split out from save_plot so the zoom window draws through the same code: a
     plot you have zoomed into and the PNG on disk should differ in nothing but
     the axis limits."""
+    for i, (freqs, amps, label) in enumerate(refs):
+        ax.plot(freqs, amps, lw=1.0, label=label, zorder=1,
+                color=REF_GREYS[i % len(REF_GREYS)])
     for freqs, amps, label in traces:
-        ax.plot(freqs, amps, lw=1.2, label=label,
-                color="blue" if len(traces) == 1 else None)
+        ax.plot(freqs, amps, lw=1.2, label=label, zorder=2,
+                color="blue" if len(traces) == 1 and not refs else None)
 
+    everything = list(traces) + list(refs)
     rescaled = False
-    if ymin is not None and ymax is not None:
-        low = min(float(np.min(a)) for _, a, _ in traces)
-        high = max(float(np.max(a)) for _, a, _ in traces)
+    if ymin is not None and ymax is not None and everything:
+        low = min(float(np.nanmin(a)) for _, a, _ in everything)
+        high = max(float(np.nanmax(a)) for _, a, _ in everything)
         if high > ymax:
             ymax, rescaled = high, True
         if low < ymin:
@@ -170,7 +251,8 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
         # A log axis cannot draw a zero or a negative bin, so a trace that
         # reaches one is drawn linear instead and the notes say why rather than
         # leaving a plot that quietly disagrees with the analyzer's screen.
-        if min(float(np.min(a)) for _, a, _ in traces) > 0:
+        if everything and min(float(np.nanmin(a))
+                              for _, a, _ in everything) > 0:
             ax.set_yscale("log")
             ax.grid(True, which="minor", alpha=0.3)
         else:
@@ -190,18 +272,21 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
         ax.text(0.5, 1.008, notes, transform=ax.transAxes, ha="center",
                 va="bottom", fontsize=9, color="#444", linespacing=1.4)
     ax.grid(True)
-    if legend and 1 < len(traces) <= 12:
+    # A reference always earns a legend entry - unlabelled grey is just clutter
+    # - so one trace against one reference is a legend where one trace alone
+    # is not.
+    if legend and 1 < len(everything) <= 12:
         ax.legend(fontsize=9)
 
 
 def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
-              dpi=PLOT_DPI, yscale="linear"):
+              dpi=PLOT_DPI, yscale="linear", refs=()):
     """The same plot as a PNG. `path` may be a file object, which is how the
     peek keeps its picture out of the file system."""
     fig = Figure(figsize=(8, 6))
     FigureCanvasAgg(fig)
     draw_traces(fig.add_subplot(111), traces, title, subtitle, ylabel,
-                ymin, ymax, legend, yscale)
+                ymin, ymax, legend, yscale, refs=refs)
     fig.tight_layout()
     fig.savefig(path, format="png", dpi=dpi)
 
@@ -228,6 +313,13 @@ class App:
         # When the building sweep was last redrawn, so a long sweep of short
         # runs does not spend its time drawing instead of measuring.
         self.last_progress = 0.0
+        # Sequences loaded off disk to draw underneath what is being measured.
+        # They outlive a grab and a sweep on purpose: the reason to load last
+        # week's floor is to take this week's against it, and that is several
+        # captures, not one. `said` keeps a warning about one of them from
+        # repeating on every redraw.
+        self.compare = []
+        self.said = set()
         self.zoom_win = self.zoom_fig = self.zoom_ax = None
         self.zoom_canvas = self.zoom_tb = None
         # Range hold: the input range a measurement set is pinned to, and when
@@ -258,6 +350,7 @@ class App:
         self.build_sweep(left, pad)
         self.build_options(left, pad)
         self.build_hold(left, pad)
+        self.build_compare(left, pad)
         self.build_log(left, pad)
         self.build_preview(right, pad)
         self.build_settings(right, pad)
@@ -487,6 +580,33 @@ class App:
                                      foreground="#c60")
         self.hold_status.pack(anchor="w", padx=10, pady=(0, 6))
 
+    def build_compare(self, parent, pad):
+        """Other sequences, loaded off disk and drawn underneath.
+
+        A sequence here is what a stitch leaves behind: the CSVs a run wrote,
+        grouped by the name they share and the day they were taken. Picked with
+        a file dialog rather than typed, because the titles have spaces in them
+        and the comparison that matters usually crosses dated folders - last
+        week's floor against this week's.
+        """
+        f = ttk.LabelFrame(parent, text="Compare  (saved sequences, drawn "
+                                        "underneath)")
+        f.pack(fill="x", **pad)
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Button(row, text="Add sequences...",
+                   command=self.do_compare_add).pack(side="left")
+        self.compare_btn = ttk.Button(row, text="Plot comparison",
+                                      command=self.do_compare_plot,
+                                      state="disabled")
+        self.compare_btn.pack(side="left", padx=6)
+        self.compare_clear_btn = ttk.Button(row, text="Clear",
+                                            command=self.do_compare_clear,
+                                            state="disabled")
+        self.compare_clear_btn.pack(side="left")
+        self.compare_status = ttk.Label(f, text="nothing loaded", foreground="#666")
+        self.compare_status.pack(anchor="w", padx=10, pady=(0, 6))
+
     def build_log(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Log")
         f.pack(fill="both", expand=True, **pad)
@@ -625,6 +745,7 @@ class App:
                     self.arng_chk, self.arm_btn, self.pin_btn):
             btn.configure(state=state)
         self.refresh_hold()
+        self.refresh_compare()
         # Connect is the one button that means something while disconnected.
         self.connect_btn.configure(state="disabled" if busy else "normal")
         self.stop_btn.configure(state="normal" if busy else "disabled")
@@ -707,11 +828,11 @@ class App:
 
     # -- zoom window ------------------------------------------------------
 
-    def remember_plot(self, traces, title, subtitle, ylabel, yscale):
+    def remember_plot(self, traces, title, subtitle, ylabel, yscale, refs=()):
         """Keep what was just drawn so the zoom window can rebuild it from the
         data. Called from the worker threads, so the window itself is only
         touched by way of the main loop."""
-        self.last_plot = (traces, title, subtitle, ylabel, yscale)
+        self.last_plot = (traces, title, subtitle, ylabel, yscale, refs)
         self.root.after(0, self.plot_arrived)
 
     def plot_arrived(self):
@@ -782,11 +903,11 @@ class App:
         same drawing code the PNG goes through."""
         if not self.zoom_open() or self.last_plot is None:
             return
-        traces, title, subtitle, ylabel, yscale = self.last_plot
+        traces, title, subtitle, ylabel, yscale, refs = self.last_plot
         self.zoom_ax.clear()
         try:
             draw_traces(self.zoom_ax, traces, title, subtitle, ylabel,
-                        *self.y_window(ylabel), yscale=yscale)
+                        *self.y_window(ylabel), yscale=yscale, refs=refs)
             self.zoom_fig.tight_layout()
             self.zoom_canvas.draw_idle()
         except Exception as exc:
@@ -1125,6 +1246,167 @@ class App:
         return hold_notes(self.pinned_range, snap,
                           set_name=self.set_name.get().strip(),
                           armed_at=self.pinned_at)
+
+    # -- compare ----------------------------------------------------------
+
+    def log_once(self, text):
+        """A warning about a loaded sequence, said once. refs_for() runs on
+        every redraw, and a sweep redraws once a run."""
+        if text not in self.said:
+            self.said.add(text)
+            self.log(text)
+
+    def do_compare_add(self):
+        """Pick saved captures and group them into sequences to draw against."""
+        paths = filedialog.askopenfilenames(
+            title="Pick the CSVs of the sequences to compare",
+            initialdir=self.outdir.get() or ".",
+            filetypes=[("Capture CSVs", "*.csv"), ("All files", "*.*")])
+        if not paths:
+            return
+        found = load_sequences(paths, log=self.log)
+        if not found:
+            self.log("Nothing loadable in that selection.")
+            return
+        by_name = {s["name"]: s for s in self.compare}
+        for seq in found:
+            if seq["name"] in by_name:
+                self.log(f"  (reloaded {seq['name']})")
+            by_name[seq["name"]] = seq
+        self.compare = sorted(by_name.values(), key=lambda s: s["name"])
+        self.said.clear()
+        self.log(f"Compare: {len(found)} sequence(s) loaded, "
+                 f"{len(self.compare)} in all")
+        for seq in self.compare:
+            self.log(f"  {seq['name']}   {seq['segments']} seg   "
+                     f"{pretty_units(seq['ylabel'])}   "
+                     f"{seq['freqs'][0]:.6g} to {seq['freqs'][-1]:.6g} Hz")
+        self.refresh_compare()
+        if not self.busy:
+            self.do_compare_plot()
+
+    def do_compare_clear(self):
+        self.compare = []
+        self.said.clear()
+        self.log("Compare: cleared. Nothing is drawn underneath any more.")
+        self.refresh_compare()
+
+    def refresh_compare(self):
+        """Main thread. Keep the compare line and its buttons telling the
+        truth."""
+        n = len(self.compare)
+        if n:
+            self.compare_status.configure(
+                text=f"{n} sequence(s): "
+                     + "; ".join(s["name"] for s in self.compare),
+                foreground="#060")
+        else:
+            self.compare_status.configure(text="nothing loaded",
+                                          foreground="#666")
+        state = "normal" if n and not self.busy else "disabled"
+        self.compare_btn.configure(state=state)
+        self.compare_clear_btn.configure(state="normal" if n else "disabled")
+
+    def compare_scale(self):
+        """The scale a comparison is drawn on: the first loaded sequence whose
+        units this module recognises.
+
+        Not simply the first one. A capture with no header, or one naming
+        something the unit model does not know, would otherwise become the
+        target that everything else has to convert to - and nothing can convert
+        to an unknown scale, so every sequence that WAS on a known one would be
+        dropped and the unreadable one left holding the plot on its own.
+        """
+        for seq in self.compare:
+            if unit_parts(seq["ylabel"]) is not None:
+                return seq["ylabel"]
+        return self.compare[0]["ylabel"] if self.compare else ""
+
+    def ref_label(self, seq, ylabel):
+        name = f"{seq['name']}  ({seq['segments']} seg)"
+        if seq["ylabel"] != ylabel:
+            name += f", was {pretty_units(seq['ylabel'])}"
+        return name
+
+    def refs_for(self, ylabel):
+        """The loaded sequences as traces on `ylabel`'s scale, or [].
+
+        Converted here rather than when they were loaded, because what they have
+        to match is whatever the plot they are going under turns out to be
+        measured in - and that is decided by UNIT on the analyzer, which can
+        move between one capture and the next. A sequence that cannot be put on
+        this scale is left out and said once, rather than drawn on an axis that
+        does not describe it: a dBVrms/sqrtHz trace and a Vpk/sqrtHz one differ
+        by 160 dB, and stacking them would draw a straight line at zero and a
+        floor off the bottom of the plot.
+        """
+        out = []
+        for seq in self.compare:
+            if seq["ylabel"] == ylabel:
+                amps = seq["amps"]
+            else:
+                try:
+                    amps = convert_amplitude(seq["amps"], seq["ylabel"], ylabel)
+                except ValueError as exc:
+                    self.log_once(f"  (compare: {seq['name']} left out - {exc})")
+                    continue
+                self.log_once(f"  (compare: {seq['name']} converted from "
+                              f"{pretty_units(seq['ylabel'])} to "
+                              f"{pretty_units(ylabel)})")
+            out.append((seq["freqs"], amps, self.ref_label(seq, ylabel)))
+        return out
+
+    def do_compare_plot(self):
+        """Draw the loaded sequences against each other, in colour.
+
+        The one plot here where they are the subject rather than the backdrop,
+        so they get the colours. Everything goes on the first sequence's scale,
+        which keeps whichever was loaded first as the one that is not being
+        converted, and the subtitle says what was.
+        """
+        if self.busy or not self.compare:
+            return
+        if Figure is None:
+            self.log("matplotlib is not installed, so there is nothing to draw "
+                     "the comparison with.")
+            return
+        ylabel = self.compare_scale()
+        traces, converted = [], []
+        for seq in self.compare:
+            if seq["ylabel"] == ylabel:
+                amps = seq["amps"]
+            else:
+                try:
+                    amps = convert_amplitude(seq["amps"], seq["ylabel"], ylabel)
+                except ValueError as exc:
+                    self.log(f"  ({seq['name']} left out - {exc})")
+                    continue
+                converted.append(seq["name"])
+            traces.append((seq["freqs"], amps, self.ref_label(seq, ylabel)))
+        if not traces:
+            self.log("Nothing left to plot once the units were checked.")
+            return
+        bits = [f"{len(traces)} sequence(s)"]
+        if converted:
+            bits.append(f"converted to {pretty_units(ylabel)}: "
+                        + ", ".join(converted))
+        bits.append(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        outdir = self.target_dir()
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            base = unique_base(outdir,
+                               f"{self.safe_title()}_compare_"
+                               f"{datetime.datetime.now():%Y%m%d}", (".png",))
+            # refs=() and not the default: here the loaded sequences ARE the
+            # traces, and letting refs_for() add them again would draw every
+            # one of them twice, once in colour and once in grey underneath.
+            self.write_plot(base + ".png", traces,
+                            self.plot_title(note="comparison"),
+                            SUBTITLE_SEP.join(bits), ylabel,
+                            "linear" if ylabel.startswith("dB") else "log",
+                            refs=())
+        except Exception as exc:
+            self.log(f"ERROR: the comparison could not be written: {exc}")
 
     # -- settling ---------------------------------------------------------
 
@@ -1783,17 +2065,19 @@ class App:
         return (self.float_of(self.ymin, DEFAULT_YMIN, "y min"),
                 self.float_of(self.ymax, DEFAULT_YMAX, "y max"))
 
-    def plot_png(self, traces, title, subtitle, ylabel, yscale="linear"):
+    def plot_png(self, traces, title, subtitle, ylabel, yscale="linear",
+                 refs=None):
         """The same plot as a PNG in memory, for the peek. Drawn coarser than a
         saved one: it is only ever seen scaled down into the preview box."""
+        refs = self.refs_for(ylabel) if refs is None else refs
         buf = io.BytesIO()
         save_plot(buf, traces, title, subtitle, ylabel, *self.y_window(ylabel),
-                  dpi=PEEK_DPI, yscale=yscale)
-        self.remember_plot(traces, title, subtitle, ylabel, yscale)
+                  dpi=PEEK_DPI, yscale=yscale, refs=refs)
+        self.remember_plot(traces, title, subtitle, ylabel, yscale, refs)
         return buf.getvalue()
 
     def write_plot(self, path, traces, title, subtitle, ylabel,
-                   yscale="linear", show=True):
+                   yscale="linear", show=True, refs=None):
         """`show=False` writes the file without taking over the preview and the
         zoom window. That is what a sweep wants for its per-run plots: they are
         still saved, but the window is showing the combined picture building up
@@ -1801,16 +2085,17 @@ class App:
         if Figure is None:
             self.log("  (no matplotlib: skipping the plot)")
             return
+        refs = self.refs_for(ylabel) if refs is None else refs
         try:
             save_plot(path, traces, title, subtitle, ylabel,
-                      *self.y_window(ylabel), yscale=yscale)
+                      *self.y_window(ylabel), yscale=yscale, refs=refs)
         except Exception as exc:
             self.log(f"  (plot failed: {exc})")
             return
         self.log(f"  {os.path.basename(path)}")
         if not show:
             return
-        self.remember_plot(traces, title, subtitle, ylabel, yscale)
+        self.remember_plot(traces, title, subtitle, ylabel, yscale, refs)
         self.root.after(0, lambda p=path: self.show_preview(p))
 
     def show_sweep_so_far(self, done, planned, ylabel, yscale, force=False):

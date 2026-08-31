@@ -16,6 +16,7 @@ clean-looking overload line. The analyzer never complains, so the test has to.
 
     python tests/test_grab.py
 """
+import glob
 import json
 import os
 import shutil
@@ -30,6 +31,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sr760 as S                                    # noqa: E402
 import spectrum_grab as sg                           # noqa: E402
+from spectrum_grab import load_sequences             # noqa: E402
+from sr760 import trace_units                        # noqa: E402
+
+# Units are drawn as "Vpk/√Hz", and a Windows console is cp1252, which cannot
+# encode it - so printing a check's detail would fail on the character rather
+# than on the check. The panel itself never meets this: it logs into a Tk
+# widget, and under pythonw there is no stdout at all.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 checks = 0
 
@@ -798,6 +810,223 @@ ok("force overrides the throttle",
                              "linear", force=True))
 ok("nothing to draw yet draws nothing",
    not app.show_sweep_so_far([], 2, "dBV", "linear", force=True))
+root.destroy()
+
+# ------------------------------------------ 10. comparing saved sequences
+
+print("\n--- reading the units back off disk ---")
+
+ok("the CSV spelling and the live one are one scale",
+   S.unit_parts("dBVrms_sqrtHz") == S.unit_parts("dBVrms/sqrtHz")
+   == ("dBVrms", True))
+ok("a plain scale has no density flag", S.unit_parts("Vpk") == ("Vpk", False))
+ok("the drawn spelling parses too", S.unit_parts("Vrms/√Hz") == ("Vrms", True))
+# Phase is the one that matters: degrees do not convert into volts.
+ok("phase is not an amplitude scale", S.unit_parts("deg") is None)
+ok("nor is anything unrecognised", S.unit_parts("bananas") is None)
+# Was: the header spelling never compared equal to trace_units(), so a loaded
+# sequence was "converted" from a scale to itself and the axis kept the
+# underscore.
+ok("the header spelling canonicalises to the live one",
+   S.canonical_units("dBVrms_sqrtHz") == "dBVrms/sqrtHz")
+ok("... and an unknown label is handed back untouched",
+   S.canonical_units("bananas") == "bananas")
+ok("the axis label is drawn either way",
+   S.pretty_units("Vpk_sqrtHz") == S.pretty_units("Vpk/sqrtHz") == "Vpk/√Hz")
+
+print("\n--- converting between scales ---")
+
+# 1 Vpk is 0 dBV, and is 1/sqrt(2) Vrms, which is -3.01 dBVrms.
+ok("Vpk to dBV is 20 log10",
+   abs(S.convert_amplitude([1.0], "Vpk", "dBV")[0]) < 1e-12)
+ok("Vpk to Vrms divides by root two",
+   abs(S.convert_amplitude([1.0], "Vpk", "Vrms")[0] - 1 / np.sqrt(2)) < 1e-12)
+ok("Vpk to dBVrms is 3.01 dB down",
+   abs(S.convert_amplitude([1.0], "Vpk", "dBVrms")[0] + 3.0103) < 1e-3,
+   f"{S.convert_amplitude([1.0], 'Vpk', 'dBVrms')[0]:.4f} dB")
+# The real case this was built for: the 20260826 floor is in dBVrms/sqrtHz and
+# the 20260830 one in Vpk/sqrtHz, so one of them has to move to be compared.
+# -137.7 dBVrms is 10**(-137.7/20) = 1.3033e-7 Vrms, and root two more in peak.
+got = S.convert_amplitude([-137.7], "dBVrms/sqrtHz", "Vpk/sqrtHz")[0]
+want = 10 ** (-137.7 / 20.0) * np.sqrt(2)
+ok("a real dBVrms floor converts to volts peak", abs(got - want) < 1e-15,
+   f"{got:.5g} Vpk/sqrtHz")
+ok("... which is 1.843e-7", abs(got - 1.8430e-7) < 1e-11, f"{got:.5g}")
+for a, b in (("Vpk", "dBV"), ("Vrms", "dBVrms"), ("dBV", "Vrms"),
+             ("dBVrms", "Vpk")):
+    there = S.convert_amplitude([0.5], a, b)
+    back = S.convert_amplitude(there, b, a)
+    ok(f"{a} -> {b} -> {a} round trips", abs(back[0] - 0.5) < 1e-12)
+ok("the same scale is left alone",
+   S.convert_amplitude([1.0, 2.0], "dBV", "dBV").tolist() == [1.0, 2.0])
+# A linear trace that reaches zero has no dB equivalent; a gap beats -inf
+# dragging the axis to the floor.
+conv = S.convert_amplitude([1.0, 0.0, -1.0], "Vpk", "dBV")
+ok("a non-positive volt reading becomes a gap, not minus infinity",
+   np.isfinite(conv[0]) and np.isnan(conv[1]) and np.isnan(conv[2]),
+   str(conv))
+
+print("\n--- and refusing to ---")
+
+for frm, to, why in (("Vpk/sqrtHz", "Vpk", "density against spectrum"),
+                     ("Vpk", "Vrms/sqrtHz", "the other way round"),
+                     ("deg", "dBV", "phase into volts"),
+                     ("dBV", "rad", "volts into phase")):
+    try:
+        S.convert_amplitude([1.0], frm, to)
+        ok(f"{why} is refused", False, "it converted instead")
+    except ValueError as exc:
+        ok(f"{why} is refused", True, str(exc)[:56])
+
+print("\n--- loading captures back ---")
+
+out = os.path.join(TMP, "seqs")
+os.makedirs(out, exist_ok=True)
+f1 = np.linspace(0, 390, 8)
+f2 = np.linspace(390, 780, 8)
+for name, freqs, label in (("floor_span11_390Hz_20260830", f1, "dBVrms/sqrtHz"),
+                           ("floor_span11_strf390Hz_780Hz_20260830", f2,
+                            "dBVrms/sqrtHz")):
+    S.write_csv(os.path.join(out, name + ".csv"), freqs,
+                np.full(8, -120.0), label)
+S.write_csv(os.path.join(out, "other_span11_390Hz_20260830.csv"), f1,
+            np.full(8, 1e-6), "Vpk/sqrtHz")
+
+freqs, amps, ylabel = S.read_csv(os.path.join(out,
+                                              "floor_span11_390Hz_20260830.csv"))
+ok("a written capture reads back", len(freqs) == 8 and amps[0] == -120.0)
+ok("... carrying the scale it was measured on", ylabel == "dBVrms_sqrtHz",
+   ylabel)
+# A file with no header must not lose its first data row to skiprows.
+bare = os.path.join(out, "bare.csv")
+np.savetxt(bare, np.column_stack([f1, np.full(8, -3.0)]), delimiter=",")
+bf, ba, bl = S.read_csv(bare)
+ok("a headerless file keeps every row", len(bf) == 8 and bl == "", f"{len(bf)}")
+
+print("\n--- grouping into sequences ---")
+
+ok("the name is what the segments share",
+   sg.sequence_label(os.path.join(out, "floor_span11_strf390Hz_780Hz_2026.csv"))
+   .startswith("floor"),
+   sg.sequence_label(os.path.join(out, "floor_span11_390Hz_2026.csv")))
+ok("the folder is part of it - one title on two days is two sequences",
+   sg.sequence_label(r"C:\d\20260826\a_span11_390Hz_x.csv")
+   != sg.sequence_label(r"C:\d\20260830\a_span11_390Hz_x.csv"))
+
+paths = sorted(glob.glob(os.path.join(out, "*.csv")))
+seqs = load_sequences(paths)
+by = {s["name"].split()[0]: s for s in seqs}
+ok("segments of one title become one sequence",
+   by["floor"]["segments"] == 2, str(by["floor"]["segments"]))
+ok("... concatenated and sorted into one curve",
+   len(by["floor"]["freqs"]) == 16
+   and list(by["floor"]["freqs"]) == sorted(by["floor"]["freqs"]),
+   str(len(by["floor"]["freqs"])))
+ok("... on the scale its header named",
+   by["floor"]["ylabel"] == "dBVrms/sqrtHz", by["floor"]["ylabel"])
+ok("a different title is a different sequence", "other" in by)
+ok("a headerless file is still a sequence of its own", "bare" in by)
+
+# A segment measured in something else is not part of the same measurement.
+mixed = os.path.join(TMP, "mixed")
+os.makedirs(mixed, exist_ok=True)
+S.write_csv(os.path.join(mixed, "m_span11_390Hz_x.csv"), f1,
+            np.full(8, -120.0), "dBVrms/sqrtHz")
+S.write_csv(os.path.join(mixed, "m_span11_strf390Hz_780Hz_x.csv"), f2,
+            np.full(8, 1e-6), "Vpk/sqrtHz")
+said = []
+got = load_sequences(sorted(glob.glob(os.path.join(mixed, "*.csv"))),
+                     log=said.append)
+ok("a segment in other units is dropped from its group",
+   got[0]["segments"] == 1, str(got[0]["segments"]))
+ok("... and said so", any("dropped" in m for m in said),
+   " ".join(said)[:76])
+
+print("\n--- drawing them underneath ---")
+
+root, app = build_app()
+app.compare = load_sequences(paths)
+app.refresh_compare()
+ok("the panel says what is loaded",
+   "3 sequence" in app.compare_status.cget("text"),
+   app.compare_status.cget("text")[:60])
+
+refs = app.refs_for("dBVrms/sqrtHz")
+ok("a sequence already on the scale is used as it is",
+   any("floor" in r[2] and "was" not in r[2] for r in refs),
+   str([r[2] for r in refs]))
+ok("one on another scale is converted and the legend says so",
+   any("other" in r[2] and "was Vpk/√Hz" in r[2] for r in refs),
+   str([r[2] for r in refs]))
+clear_log(app)
+app.refs_for("dBVrms/sqrtHz")
+ok("the conversion is not announced again on every redraw",
+   logged(app).count("converted from") == 0, logged(app)[:60])
+
+# Phase cannot go on an amplitude axis at all.
+clear_log(app)
+app.said.clear()
+refs = app.refs_for("deg")
+ok("nothing is drawn against an axis it cannot be put on", refs == [])
+ok("... and each one is named once", logged(app).count("left out") == 3,
+   str(logged(app).count("left out")))
+
+print("\n--- the comparison plot ---")
+
+cmp_out = os.path.join(TMP, "cmp")
+os.makedirs(cmp_out, exist_ok=True)
+app.outdir.set(cmp_out)
+app.dated.set(False)
+shown = []
+app.show_preview = lambda p: shown.append(p)
+app.do_compare_plot()
+root.update()
+made = [n for n in os.listdir(cmp_out) if n.endswith(".png")]
+ok("a comparison is saved", len(made) == 1, str(made))
+ok("... named for what it is", "_compare_" in made[0], made[0])
+ok("... and shown", len(shown) == 1)
+# Was going to be drawn twice: once in colour as the subject, once in grey
+# underneath, because write_plot fills refs in when it is not told otherwise.
+traces, _t, _s, ylabel, _y, plot_refs = app.last_plot
+ok("the sequences are the traces, not also the references",
+   plot_refs == (), f"{len(traces)} traces, {len(plot_refs)} refs")
+# Was: the scale came from compare[0], so the headerless 'bare' sequence -
+# first alphabetically, and on no scale at all - became the target that
+# nothing could convert to, and the two real sequences were dropped instead.
+ok("the scale comes from a sequence that has one",
+   ylabel == "dBVrms/sqrtHz", ylabel)
+ok("... so the sequences on a known scale are the ones that plot",
+   len(traces) == 2, f"{len(traces)} traces")
+ok("... and the one with no units is left out and named",
+   "bare" in logged(app) and "left out" in logged(app),
+   " ".join(logged(app).split())[-88:])
+
+app.do_compare_clear()
+ok("clearing empties it", app.compare == [] and app.refs_for("dBV") == [])
+ok("... and the panel says so",
+   "nothing loaded" in app.compare_status.cget("text"))
+root.destroy()
+
+print("\n--- and under a building sweep ---")
+
+out = os.path.join(TMP, "sweepref")
+os.makedirs(out, exist_ok=True)
+root, app = build_app(outdir=out)
+app.compare = load_sequences(paths)
+app.save_csv.set(False), app.save_txt.set(False), app.save_npy.set(False)
+app.save_png.set(False), app.combined.set(True)
+app.lock.set(False), app.pause_cases.set(False)
+was, sg.PROGRESS_MIN_S = sg.PROGRESS_MIN_S, 0.0
+try:
+    app._grab_runs([""], [0.0, 1.0, 2.0], [11])
+    root.update()
+finally:
+    sg.PROGRESS_MIN_S = was
+traces, _t, _s, ylabel, _y, plot_refs = app.last_plot
+ok("the building sweep carries the references underneath",
+   len(plot_refs) >= 1, f"{len(traces)} traces, {len(plot_refs)} refs")
+ok("... converted onto the capture's own scale",
+   ylabel == trace_units(GOOD), ylabel)
 root.destroy()
 
 shutil.rmtree(TMP, ignore_errors=True)

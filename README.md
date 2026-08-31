@@ -417,6 +417,54 @@ difference is that it says so rather than passing itself off as complete:
 A sweep that dies on an instrument error is written up the same way, so a fault
 on the last segment does not cost you the earlier ones.
 
+## Comparing sequences
+
+**Add sequences…** picks saved captures off disk and draws them underneath
+whatever you measure next — this week's floor against last week's, a device
+against a 50 Ω termination, one range step against another.
+
+A *sequence* is what a stitch leaves behind: the CSVs of one title, taken on one
+day, joined back into a single curve in frequency order. Overlapping points
+where segments meet are both kept rather than averaged, which is what makes a
+bad join visible. Pick any of a sequence's CSVs in the dialog and the ones you
+picked are grouped by the name and the folder they share, so a comparison across
+dated folders — the usual one — takes one trip through the dialog.
+
+They are read through the CSVs and not the `.npy` matrices for one reason: **the
+matrices do not record the units**. The CSV header does, and without it there is
+no way to know that `20260826` is in `dBVrms/√Hz` and `20260830` is in
+`Vpk/√Hz`. Stacking those two raw would put `1e-8` against `-160` on one axis.
+
+So everything is converted onto the scale of the plot it is going under, through
+volts peak, and the legend says what each sequence *was*:
+
+```
+50 ohm full span grounded  20260830  (66 seg)
+Trek X2 mon no drive  20260826  (65 seg), was dBVrms/√Hz
+```
+
+What cannot be converted is left out and named in the log, once, rather than
+drawn on an axis that does not describe it. A spectrum and a spectral density
+are not the same measurement and converting between them needs a bin width no
+file here carries; phase is not an amplitude at all. A linear reading of zero or
+less has no dB equivalent and becomes a gap rather than dragging the axis to the
+floor.
+
+Loaded sequences show up in three places:
+
+- **underneath every capture** — grabs, peeks and the building sweep alike — in
+  grey and behind, so the colours go on meaning the thing being measured;
+- **on the saved PNGs**, since a plot that was read against a reference should
+  carry it;
+- **as the subject of their own plot**, with **Plot comparison**, which gives
+  them the colours and writes `<title>_compare_<date>.png`. That one is drawn on
+  the first loaded sequence's scale — the first whose units are recognised, so a
+  stray headerless CSV cannot become a target nothing else can convert to.
+
+They outlive a grab and a sweep on purpose: the reason to load last week's floor
+is to take this week's against it, and that is several captures. **Clear** drops
+them. Nothing is ever written back to the files they came from.
+
 **Stitch to _x_ Hz, overlap _n_ points** fills the start-frequency box with
 segments that tile 0 Hz up to _x_ at the span the analyzer is on, stepping by
 `(400 - n)` bins so each segment repeats the last _n_ frequency points of the

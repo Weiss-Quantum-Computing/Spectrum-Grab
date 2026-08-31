@@ -60,6 +60,8 @@ __all__ = [
     "record_stats", "stats_notes", "averaging_fault", "readout_fault",
     "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
     "TRANSFER_BINARY_S", "TRANSFER_ASCII_S", "fmt_hms", "capture_time",
+    "UNIT_BASES", "unit_parts", "canonical_units", "to_volts_pk",
+    "from_volts_pk", "convert_amplitude", "read_csv",
 ]
 
 DEFAULT_ADDRESS = "GPIB0::10::INSTR"
@@ -564,8 +566,117 @@ def trace_units(snap):
 
 
 def pretty_units(label):
-    """The same label for a plot axis, where the root sign can be drawn."""
-    return label.replace("/sqrtHz", "/√Hz")
+    """The same label for a plot axis, where the root sign can be drawn. The
+    underscore form is what safe_name() leaves in a CSV header, so a label read
+    back off disk gets the same treatment as one straight from the analyzer."""
+    return label.replace("/sqrtHz", "/√Hz").replace("_sqrtHz", "/√Hz")
+
+
+def canonical_units(label):
+    """A units label in the one spelling trace_units() uses.
+
+    write_csv puts the label through safe_name(), so a trace measured in
+    "dBVrms/sqrtHz" comes back out of its own header as "dBVrms_sqrtHz". They
+    are one scale, and anything comparing a loaded trace against a live one has
+    to see them as one - otherwise a sequence gets "converted" from a unit to
+    itself, and the axis carries the underscore. Anything unrecognised is
+    handed back as it came, since inventing a spelling for it would be worse.
+    """
+    parts = unit_parts(label)
+    if parts is None:
+        return (label or "").strip()
+    base, per = parts
+    return base + ("/sqrtHz" if per else "")
+
+
+# The four scales UNIT can put a trace on. dBV is dB relative to one volt peak
+# and dBVrms to one volt rms, which is the whole of the difference between them
+# and the reason a conversion has to go through volts rather than adding an
+# offset.
+UNIT_BASES = ("Vpk", "Vrms", "dBV", "dBVrms")
+ROOT2 = float(np.sqrt(2.0))
+
+
+def unit_parts(label):
+    """A trace-units label as (base, per_root_hz), or None.
+
+    Takes what trace_units() produces and what write_csv() writes into a CSV
+    header, which is the same string through safe_name() - so "dBVrms/sqrtHz"
+    and "dBVrms_sqrtHz" are one label read two ways, and a comparison built on
+    the files can recover what the trace was measured in.
+
+    None for anything that is not one of the four amplitude scales. Phase is
+    the case that matters: degrees do not convert into volts, and a compare
+    that quietly put them on the same axis would be drawing nonsense.
+    """
+    text = (label or "").strip()
+    per = False
+    for tail in ("/sqrtHz", "_sqrtHz", "/√Hz"):
+        if text.endswith(tail):
+            text, per = text[:-len(tail)], True
+            break
+    for base in UNIT_BASES:
+        if text.lower() == base.lower():
+            return base, per
+    return None
+
+
+def to_volts_pk(amps, base):
+    """One of the four scales into volts peak, which is the pivot everything
+    converts through."""
+    a = np.asarray(amps, dtype=float)
+    if base == "Vpk":
+        return a
+    if base == "Vrms":
+        return a * ROOT2
+    if base == "dBV":
+        return 10.0 ** (a / 20.0)
+    if base == "dBVrms":
+        return 10.0 ** (a / 20.0) * ROOT2
+    raise ValueError(f"{base!r} is not one of {UNIT_BASES}")
+
+
+def from_volts_pk(volts, base):
+    """Volts peak back out onto one of the four scales. A value that is not
+    positive has no dB equivalent and comes back NaN rather than -inf, so it
+    leaves a gap in the plot instead of dragging the axis to the floor."""
+    v = np.asarray(volts, dtype=float)
+    if base == "Vpk":
+        return v
+    if base == "Vrms":
+        return v / ROOT2
+    if base in ("dBV", "dBVrms"):
+        ref = v if base == "dBV" else v / ROOT2
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = 20.0 * np.log10(ref)
+        return np.where(ref > 0, out, np.nan)
+    raise ValueError(f"{base!r} is not one of {UNIT_BASES}")
+
+
+def convert_amplitude(amps, from_label, to_label):
+    """A trace from one unit label onto another. Raises ValueError when the two
+    do not describe the same kind of quantity.
+
+    The refusals are the point. A spectrum and a spectral density are not the
+    same measurement and converting between them needs the bin width, which no
+    file here carries; phase is not an amplitude at all. Both come back as an
+    error rather than a plot, because the only thing worse than not being able
+    to compare two traces is being shown a comparison that is wrong.
+    """
+    a, b = unit_parts(from_label), unit_parts(to_label)
+    if a is None or b is None:
+        bad = from_label if a is None else to_label
+        raise ValueError(f"{bad!r} is not one of the amplitude scales "
+                         f"{UNIT_BASES}, so it cannot be converted")
+    if a[1] != b[1]:
+        raise ValueError(
+            f"{from_label!r} and {to_label!r} are not the same kind of "
+            f"quantity - one is per root hertz and the other is not, and "
+            f"converting between them needs the bin width the file does not "
+            f"carry")
+    if a[0] == b[0]:
+        return np.asarray(amps, dtype=float)
+    return from_volts_pk(to_volts_pk(amps, a[0]), b[0])
 
 
 def reads_in_db(snap):
@@ -1413,6 +1524,33 @@ def write_csv(path, freqs, amps, ylabel):
     rows = np.column_stack([freqs, amps])
     np.savetxt(path, rows, delimiter=",", comments="",
                header=f"Frequency (Hz),{safe_name(ylabel)}")
+
+
+def read_csv(path):
+    """A capture back off disk as (freqs, amps, ylabel).
+
+    The counterpart of write_csv, and in this file for the same reason it is:
+    the header names the scale the trace was measured on, and reading it back is
+    the only way anything downstream can know. The .npy matrices a sweep writes
+    do not carry it, so a comparison across sessions has to come through here.
+
+    A file with no header, or one naming a scale this module does not know, is
+    still loaded - the label comes back as it was written, or empty, and the
+    caller decides what that is worth.
+    """
+    with open(path, encoding="utf-8") as fh:
+        first = fh.readline().strip()
+    fields = first.split(",")
+    try:                                  # a header is a line that is not data
+        float(fields[0])
+        ylabel, skip = "", 0
+    except (ValueError, IndexError):
+        ylabel = fields[1].strip() if len(fields) > 1 else ""
+        skip = 1
+    rows = np.loadtxt(path, delimiter=",", skiprows=skip, ndmin=2)
+    if rows.shape[0] == 0 or rows.shape[1] < 2:
+        raise ValueError(f"{os.path.basename(path)} has no two-column data")
+    return rows[:, 0], rows[:, 1], ylabel
 
 
 def metadata_text(an, snap, extra, command):
