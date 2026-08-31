@@ -176,11 +176,24 @@ def sequence_label(path):
     per-segment files it used to leave behind come out under one name, which is
     what they are.
 
+    The _N that unique_base adds to a second sweep of the same title on the same
+    day is kept, as `(run 2)`. There it means a different acquisition - the
+    aborted fourteen-segment run of 2026-08-30 and the fifty-two that replaced
+    it are both `50 ohm full span grounded`, and drawing them as one curve would
+    show that band measured twice. On a per-segment file the same suffix only
+    means two files wanted one name, so it is cut with the rest.
+
     The folder joins the key because the same title measured on two days is two
     sequences, not one - which is the usual comparison.
     """
     stem = os.path.splitext(os.path.basename(path))[0]
-    head = re.split(r"_span\d|_sweep_\d", stem, maxsplit=1)[0]
+    sweep = re.match(r"^(?P<head>.+?)_sweep_\d{8}(?:_(?P<run>\d+))?$", stem)
+    if sweep:
+        head = sweep.group("head")
+        if sweep.group("run"):
+            head += f" (run {int(sweep.group('run')) + 1})"
+    else:
+        head = re.split(r"_span\d", stem, maxsplit=1)[0]
     if not head:
         head = stem
     day = os.path.basename(os.path.dirname(os.path.abspath(path)))

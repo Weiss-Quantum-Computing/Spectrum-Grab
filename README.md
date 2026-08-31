@@ -402,6 +402,19 @@ it produced, `segments/` is yours to remove.
 
 Without `--apply` it says what it would do and changes nothing.
 
+Two things it works out for itself. A title swept **twice on the same day** is
+two acquisitions, and the `_1` that `unique_base` adds does not separate them —
+the second sweep only collides on the start frequencies the first one reached,
+so an aborted 14-segment run followed by a 52-segment one came out as 52
+unsuffixed files and 14 suffixed ones, mixed. What does separate them is that a
+sweep visits each (span, start frequency) once, so in capture order a repeat
+means a new sweep began. That holds whatever the span is, which a gap in the
+clock does not — at the 191 mHz span one segment takes thirty-five minutes. The
+second run is written as `_sweep_<date>_1` and reads as `(run 2)` in Compare.
+
+And a **single capture** is left exactly where it is. One segment is not a
+sweep, and folding it into a combined file of one would only rename it.
+
 ### What it will cost
 
 A sweep of more than one run prices itself before it starts, and counts down as

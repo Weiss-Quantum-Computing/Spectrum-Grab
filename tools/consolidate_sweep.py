@@ -35,21 +35,51 @@ SEGMENT = re.compile(r"^(?P<head>.+?)_span\d+.*_(?P<date>\d{8})(?:_\d+)?$")
 
 
 def scan(folder):
-    """The per-segment captures in `folder`, grouped by the sweep they belong
-    to. A file that does not look like one a run wrote is left alone."""
-    groups = collections.defaultdict(lambda: {"csv": [], "txt": [], "png": [],
-                                              "date": ""})
+    """The per-segment captures in `folder`, grouped by title. A file that does
+    not look like one a run wrote is left alone."""
+    groups = collections.defaultdict(lambda: {"segments": {}, "date": ""})
     for name in sorted(os.listdir(folder)):
         stem, ext = os.path.splitext(name)
-        if ext.lower() not in (".csv", ".txt", ".png") or "_sweep_" in stem:
+        ext = ext.lower()
+        if ext not in (".csv", ".txt", ".png") or "_sweep_" in stem:
             continue
         m = SEGMENT.match(stem)
         if not m:
             continue
         g = groups[m.group("head")]
-        g[ext.lower()[1:]].append(os.path.join(folder, name))
+        seg = g["segments"].setdefault(stem, {"stem": stem})
+        seg[ext[1:]] = os.path.join(folder, name)
+        span = re.search(r"_span(\d+)", stem)
+        seg["span"] = span.group(1) if span else "?"
         g["date"] = m.group("date")
     return groups
+
+
+def split_runs(segments):
+    """One title's segments split into the separate sweeps that wrote them.
+
+    A title swept twice on the same day leaves both sets of files in the folder,
+    and the _1 that unique_base adds does NOT separate them: the second sweep
+    only collides on the start frequencies the first one reached, so on
+    2026-08-30 the fourteen segments of an aborted run and the fifty-two of the
+    one that replaced it came out as fifty-two unsuffixed files and fourteen
+    suffixed ones, mixed.
+
+    What does separate them is that a sweep visits each (span, start frequency)
+    once. In capture order, a pair that has already been seen means a new sweep
+    has begun. That holds whatever the span is, which a gap in the clock does
+    not - at the 191 mHz span one segment takes thirty-five minutes.
+    """
+    ordered = sorted(segments, key=lambda s: (s["captured"], s["start"]))
+    runs, seen = [], None
+    for seg in ordered:
+        key = (seg["span"], round(seg["start"], 6))
+        if seen is None or key in seen:
+            runs.append([])
+            seen = set()
+        runs[-1].append(seg)
+        seen.add(key)
+    return runs
 
 
 def read_header(path):
@@ -70,42 +100,37 @@ def read_header(path):
     return head, "\n".join(settings)
 
 
-def combine(folder, head, group, apply_it, log=print):
-    """One sweep's segments into one .csv and one .txt. Returns the paths it
-    wrote (or would write) and the segment files it would move."""
-    csvs = group["csv"]
-    if not csvs:
-        return [], []
-    loaded, units = [], set()
-    for path in csvs:
+def load(segments, log=print):
+    """Read each segment's trace. Returns (segments, ylabel) or (None, None)
+    when they are not all on one scale, since those are not one measurement."""
+    units = set()
+    for seg in segments:
         try:
-            freqs, amps, ylabel = read_csv(path)
+            seg["freqs"], seg["amps"], ylabel = read_csv(seg["csv"])
         except Exception as exc:
-            log(f"    ! {os.path.basename(path)}: {exc}")
-            return [], []
-        loaded.append((path, freqs, amps))
+            log(f"    ! {os.path.basename(seg['csv'])}: {exc}")
+            return None, None
+        seg["start"] = float(seg["freqs"][0])
         units.add(canonical_units(ylabel))
     if len(units) > 1:
-        log(f"    ! {head}: segments are on {len(units)} different scales "
+        log(f"    ! segments are on {len(units)} different scales "
             f"({', '.join(sorted(units))}) - left alone")
-        return [], []
-    ylabel = units.pop()
-    loaded.sort(key=lambda t: float(t[1][0]))          # by start frequency
+        return None, None
+    return segments, units.pop()
 
-    base = os.path.join(folder, f"{head}_sweep_{group['date']}")
+
+def combine(base, head, segments, ylabel, apply_it, log=print):
+    """One sweep's segments into one .csv and one .txt. Returns the paths it
+    wrote (or would write) and the segment files it would move."""
+    loaded = sorted(segments, key=lambda s: s["start"])
     csv_path, txt_path = base + ".csv", base + ".txt"
 
-    freqs = np.concatenate([f for _p, f, _a in loaded])
-    amps = np.concatenate([a for _p, _f, a in loaded])
-    seg = np.concatenate([np.full(len(f), i, dtype=float)
-                          for i, (_p, f, _a) in enumerate(loaded, 1)])
+    freqs = np.concatenate([s["freqs"] for s in loaded])
+    amps = np.concatenate([s["amps"] for s in loaded])
+    seg = np.concatenate([np.full(len(s["freqs"]), i, dtype=float)
+                          for i, s in enumerate(loaded, 1)])
     order = np.argsort(freqs, kind="stable")
-
-    # Every per-segment .txt, so the combined one can say what varied.
-    by_stem = {os.path.splitext(os.path.basename(p))[0]: p
-               for p in group["txt"]}
-    metas = [read_header(by_stem.get(
-        os.path.splitext(os.path.basename(p))[0], "")) for p, _f, _a in loaded]
+    metas = [read_header(s.get("txt", "")) for s in loaded]
 
     if apply_it:
         np.savetxt(csv_path, np.column_stack([freqs[order], amps[order],
@@ -113,7 +138,7 @@ def combine(folder, head, group, apply_it, log=print):
                    delimiter=",", comments="",
                    header=f"Frequency (Hz),{safe_name(ylabel)},segment")
         with open(txt_path, "w", encoding="utf-8") as fh:
-            fh.write(metadata(head, group, loaded, metas, ylabel))
+            fh.write(metadata(head, loaded, metas, ylabel))
         # Read it straight back: the point of the whole exercise is that the
         # combined file holds what the per-segment ones did.
         got_f, got_a, got_l = read_csv(csv_path)
@@ -123,10 +148,11 @@ def combine(folder, head, group, apply_it, log=print):
                                    equal_nan=True)):
             raise SystemExit(f"{csv_path} did not read back identically - "
                              f"nothing has been moved, look at it by hand")
-    return [csv_path, txt_path], group["csv"] + group["txt"] + group["png"]
+    movable = [s[k] for s in loaded for k in ("csv", "txt", "png") if k in s]
+    return [csv_path, txt_path], movable
 
 
-def metadata(head, group, loaded, metas, ylabel):
+def metadata(head, loaded, metas, ylabel):
     """The combined .txt: what every segment agreed on once, what varied in a
     table, and the settings block of the last segment verbatim."""
     common, varying = {}, []
@@ -137,7 +163,7 @@ def metadata(head, group, loaded, metas, ylabel):
             common[k] = values.pop()
         else:
             varying.append(k)
-    freqs = np.concatenate([f for _p, f, _a in loaded])
+    freqs = np.concatenate([s["freqs"] for s in loaded])
 
     lines = [f"consolidated         : "
              f"{datetime.datetime.now().isoformat(timespec='seconds')} by "
@@ -185,21 +211,49 @@ def main():
     total_moved = 0
     for head in sorted(groups):
         g = groups[head]
+        segs = [s for s in g["segments"].values() if "csv" in s]
         print(f"\n{head}  ({g['date']})")
-        print(f"  {len(g['csv'])} csv, {len(g['txt'])} txt, {len(g['png'])} png")
-        written, movable = combine(args.folder, head, g, args.apply)
-        if not written:
+        print(f"  {len(segs)} segment(s)")
+        if not segs:
             continue
-        for p in written:
-            print(f"  {'wrote' if args.apply else 'would write'} "
-                  f"{os.path.basename(p)}")
-        if args.apply:
-            os.makedirs(moved_dir, exist_ok=True)
-            for p in movable:
-                shutil.move(p, os.path.join(moved_dir, os.path.basename(p)))
-        print(f"  {'moved' if args.apply else 'would move'} {len(movable)} "
-              f"per-segment files to segments/")
-        total_moved += len(movable)
+        for s in segs:
+            header, _ = read_header(s.get("txt", ""))
+            s["captured"] = header.get("captured") or datetime.datetime\
+                .fromtimestamp(os.path.getmtime(s["csv"])).isoformat()
+        segs, ylabel = load(segs)
+        if segs is None:
+            continue
+
+        used = set()
+        for run in split_runs(segs):
+            when = f"{run[0]['captured'][11:]} to {run[-1]['captured'][11:]}"
+            if len(run) < 2:
+                # One capture is not a sweep, and folding it into a "combined"
+                # file of one segment would only rename it.
+                print(f"  {len(run)} segment at {when} - a single capture, "
+                      f"left alone")
+                continue
+            stem, n = f"{head}_sweep_{g['date']}", 0
+            while (stem in used
+                   or os.path.exists(os.path.join(args.folder, stem + ".csv"))
+                   or os.path.exists(os.path.join(args.folder, stem + ".txt"))):
+                n += 1
+                stem = f"{head}_sweep_{g['date']}_{n}"
+            used.add(stem)
+            print(f"  {len(run)} segments captured {when} -> {stem}")
+            written, movable = combine(os.path.join(args.folder, stem), head,
+                                       run, ylabel, args.apply)
+            for p in written:
+                print(f"    {'wrote' if args.apply else 'would write'} "
+                      f"{os.path.basename(p)}")
+            if args.apply:
+                os.makedirs(moved_dir, exist_ok=True)
+                for p in movable:
+                    shutil.move(p, os.path.join(moved_dir,
+                                                os.path.basename(p)))
+            print(f"    {'moved' if args.apply else 'would move'} "
+                  f"{len(movable)} per-segment files to segments/")
+            total_moved += len(movable)
 
     print(f"\n{'Moved' if args.apply else 'Would move'} {total_moved} files "
           f"in total.")

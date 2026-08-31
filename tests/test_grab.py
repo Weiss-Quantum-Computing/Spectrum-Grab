@@ -1124,6 +1124,16 @@ ok("a combined sweep CSV lands on the same name as its segments",
 ok("... and the date is not left in the name twice",
    sg.sequence_label(r"C:\d\20260826\Trek X2_sweep_20260826.csv")
    == "Trek X2  20260826")
+# A second sweep of one title on one day is a second acquisition, and drawing
+# it into the first would show the band they share measured twice.
+ok("a re-run of the same sweep stays a sequence of its own",
+   sg.sequence_label(r"C:\d\20260830\50 ohm_sweep_20260830_1.csv")
+   == "50 ohm (run 2)  20260830",
+   sg.sequence_label(r"C:\d\20260830\50 ohm_sweep_20260830_1.csv"))
+# On a per-segment file the same suffix only means two files wanted one name.
+ok("... but on a segment the suffix is just a collision, and is cut",
+   sg.sequence_label(r"C:\d\20260830\50 ohm_span11_390Hz_20260830_1.csv")
+   == sg.sequence_label(r"C:\d\20260830\50 ohm_span11_390Hz_20260830.csv"))
 
 paths = sorted(glob.glob(os.path.join(out, "*.csv")))
 seqs = load_sequences(paths)
