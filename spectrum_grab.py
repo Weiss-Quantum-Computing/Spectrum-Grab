@@ -42,12 +42,13 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    CONNECT_TIMEOUT_MS, DEFAULT_ADDRESS, DEFAULT_EXP_WAIT_S,
                    DEFAULT_SETTLE_RECS, N_BINS, PRESETS, READY_TIMEOUT_S,
                    SETTING_GROUPS, SETTLE_KEYS, SPACE_OWNERS, SPAN_CHOICES,
-                   SPANS, TRACE, averaging_fault, binary_refusal, binary_valid,
-                   code_of, fmt_setting, hold_notes, label_of, metadata_text,
-                   parse_list, parse_setting, pretty_units, readout_fault,
-                   reads_in_db, record_stats, record_time, safe_name, span_hz,
-                   stats_notes, trace_units, trace_yscale, unique_base,
-                   write_csv)
+                   SPANS, TRACE, TRANSFER_ASCII_S, TRANSFER_BINARY_S,
+                   averaging_fault, binary_refusal, binary_valid, capture_time,
+                   code_of, fmt_hms, fmt_setting, hold_notes, label_of,
+                   metadata_text, parse_list, parse_setting, pretty_units,
+                   readout_fault, reads_in_db, record_stats, record_time,
+                   safe_name, span_hz, stats_notes, trace_units, trace_yscale,
+                   unique_base, write_csv)
 
 try:
     from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
@@ -1302,15 +1303,38 @@ class App:
         # with the previous capture's units.
         sweep_ylabel, sweep_yscale = self.last_ylabel, self.last_yscale
 
+        # Wall clock for the whole sweep, and the part of it spent waiting for a
+        # human rather than for the analyzer. The ETA is rescaled by what the
+        # finished runs took, so a twenty minute pause to move a cable must not
+        # be read as evidence that the runs are slow.
+        t_sweep = time.perf_counter()
+        paused_s = 0.0
+        plan = []
+
         try:
             os.makedirs(outdir, exist_ok=True)
             if total > 1:
                 self.log(f"Sweep: {len(cases)} case(s) x {len(starts)} start "
                          f"freq(s) x {len(spans)} span(s) = {total} runs")
+                plan = self.sweep_plan(cases, starts, spans)
+                if plan:
+                    done_at = (datetime.datetime.now() + datetime.timedelta(
+                        seconds=sum(plan)))
+                    self.log(f"  about {fmt_hms(sum(plan))} of measuring, "
+                             f"finishing around {done_at:%H:%M}"
+                             + (" (pauses between cases not counted)"
+                                if len(cases) > 1 and self.pause_cases.get()
+                                else ""))
+                else:
+                    self.log("  (no time estimate: the analyzer would not say "
+                             "what span or averaging it is on)")
 
             for ic, case in enumerate(cases):
                 if case and self.pause_cases.get():
-                    if not self.confirm(f"Set up case '{case}', then continue."):
+                    t_pause = time.perf_counter()
+                    go = self.confirm(f"Set up case '{case}', then continue.")
+                    paused_s += time.perf_counter() - t_pause
+                    if not go:
                         raise KeyboardInterrupt
                 for isf, start in enumerate(starts):
                     if start is not None:
@@ -1337,6 +1361,10 @@ class App:
                             if p)
                         if label:
                             self.log(f"--- {label}")
+                        if plan:
+                            self.log("  " + self.eta(
+                                plan, len(done),
+                                time.perf_counter() - t_sweep - paused_s))
                         freqs, amps, snap, notes = self.run_one()
                         freqs_m[ic, isf, isp] = freqs
                         amps_m[ic, isf, isp] = amps
@@ -1369,6 +1397,89 @@ class App:
                                 sweep_ylabel, sweep_yscale)
         except Exception as exc:
             self.log(f"ERROR: the sweep files could not be written: {exc}")
+
+    def sweep_plan(self, cases, starts, spans):
+        """What each run of the sweep should cost, in seconds, in the order the
+        loop will walk them. [] when the analyzer will not say.
+
+        Read once, before the loop rather than per run: NAVG, the averaging mode
+        and the overlap are what set the per-capture time, and they are worth
+        asking the analyzer for rather than guessing at. The span is read too,
+        for the runs that leave it where it is.
+        """
+        try:
+            snap = self.read_settings("SPAN", "NAVG", "AVGO", "AVGM", "OVLP",
+                                      "DISP0", "UNIT0")
+        except Exception:
+            return []
+        codes = [code_of(snap, "SPAN") if s is None else s for s in spans]
+        if any(c is None for c in codes):
+            return []
+        # Only a linear average that is switched on has a length of its own.
+        # Anything else runs for the exponential wait, which is what run_one
+        # will sit out.
+        averaged = (code_of(snap, "AVGO", 0) == 1
+                    and code_of(snap, "AVGM", 0) == 0)
+        # A settle is due whenever the sweep writes a span or a start frequency,
+        # and whenever a hold re-asserts the range before the capture.
+        settles = (any(s is not None for s in spans)
+                   or any(s is not None for s in starts)
+                   or self.pinned_range is not None)
+        autorange = 0.0
+        if self.pinned_range is None and self.do_arng.get():
+            autorange = self.float_of(self.arng_s, 15.0, "auto-range time")
+        per = [capture_time(
+            code,
+            navg=code_of(snap, "NAVG"), ovlp=code_of(snap, "OVLP"),
+            averaged=averaged,
+            settle_recs=(self.float_of(self.settle_recs, DEFAULT_SETTLE_RECS,
+                                       "settle record lengths")
+                         if settles else 0.0),
+            extra_settle_s=self.float_of(self.settle_s, 0.0, "settle"),
+            autorange_s=autorange,
+            exp_wait_s=self.exp_wait(),
+            timeout_s=self.float_of(self.timeout_s, 600.0, "timeout"),
+            transfer_s=(TRANSFER_BINARY_S
+                        if self.binary.get() and binary_valid(snap)
+                        else TRANSFER_ASCII_S)) for code in codes]
+        if any(not np.isfinite(t) for t in per):
+            return []
+        return [t for _ in cases for _ in starts for t in per]
+
+    @staticmethod
+    def eta(plan, finished, measuring_s):
+        """"run 3/20 - 4m12s in, about 11m30s left, done ~15:42".
+
+        `measuring_s` is wall time with any pause for a case change taken back
+        out of it: a sweep that waited twenty minutes for someone to move a
+        cable has not learned that its runs are slow.
+
+        The plan is rescaled by what the finished runs actually took, so the
+        estimate stops being a model as soon as there is a measurement to
+        replace it with - which is also what absorbs the overlap that
+        capture_time can only put a floor under.
+
+        The correction is weighted in rather than applied whole, because one run
+        is not a measurement of anything. A first segment that timed out, or was
+        read early, would otherwise set the ratio for the entire sweep on its
+        own: an instant run against a 109 s plan says "about 0.0s left" with
+        fifteen minutes still to go. At n runs the measurement carries n/(n+2)
+        of the answer, so it leads by the third or fourth and the model is gone
+        by the tenth.
+        """
+        total = len(plan)
+        spent = sum(plan[:finished])
+        scale = 1.0
+        if finished and spent > 0:
+            weight = finished / (finished + 2.0)
+            scale = weight * (measuring_s / spent) + (1.0 - weight)
+        left = sum(plan[finished:]) * scale
+        if not np.isfinite(left):
+            return f"run {finished + 1}/{total}"
+        done_at = datetime.datetime.now() + datetime.timedelta(seconds=left)
+        return (f"run {finished + 1}/{total} - {fmt_hms(measuring_s)} in, "
+                f"about {fmt_hms(left)} left, done ~{done_at:%H:%M}"
+                + ("" if finished else " (estimated)"))
 
     def run_one(self):
         """One measurement: range, average, read out. Returns the trace, the

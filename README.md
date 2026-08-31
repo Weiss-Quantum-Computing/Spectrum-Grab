@@ -331,8 +331,43 @@ so an empty Sweep panel is a single grab at the current settings.
   `input("Press Enter to continue")`, for setting something up by hand between
   runs.
 
-The three nest: every case runs every start frequency at every span. A sweep of
-more than one run also writes
+The three nest: every case runs every start frequency at every span.
+
+### What it will cost
+
+A sweep of more than one run prices itself before it starts, and counts down as
+it goes:
+
+```
+Sweep: 1 case(s) x 10 start freq(s) x 1 span(s) = 10 runs
+  about 18m12s of measuring, finishing around 22:55
+--- span 11
+  run 1/10 - 0.0s in, about 18m12s left, done ~22:55 (estimated)
+--- span 11 start 1 Hz
+  run 2/10 - 1m50s in, about 16m24s left, done ~22:55
+```
+
+The estimate is the analyzer's own arithmetic: a record is `bins / span`, so a
+linear average of `NAVG` records takes `NAVG * T_rec`, plus the settle, the
+autorange and the transfer. NAVG, the averaging mode and the overlap are read
+from the analyzer once before the loop rather than guessed at. It is exact at
+`OVLP 0` - which is what the `protocol` preset sets, and one more reason it does
+- and a floor with overlap, because the analyzer still has to finish an FFT
+between records that share samples.
+
+It does not stay a model. Each figure is rescaled by what the finished runs
+actually took, weighted `n/(n+2)` so that one freak-fast run cannot drag the
+whole estimate to zero and a genuinely slow sweep is believed by the third or
+fourth. Time spent waiting at a **pause before each case** prompt is held out of
+that correction - a sweep that waited twenty minutes for someone to move a cable
+has not learned that its runs are slow - and the up-front line says so.
+
+An average with no finish of its own is priced at the **exponential wait**, not
+at NAVG, and the **measurement timeout** caps the estimate the way it caps the
+wait. If the sweep names no span and the analyzer will not say which one it is
+on, there is no estimate rather than a made-up one.
+
+A sweep of more than one run also writes
 
 ```
 <title>_sweep_<date>_freqs.npy    shape [case][start frequency][span][bin]

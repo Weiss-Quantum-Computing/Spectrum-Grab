@@ -16,6 +16,7 @@ clean-looking overload line. The analyzer never complains, so the test has to.
 
     python tests/test_grab.py
 """
+import json
 import os
 import shutil
 import sys
@@ -158,8 +159,10 @@ def build_app(snap=None, errs=0, ffts=0, outdir=None):
     with open(sg.CONFIG_PATH, "w", encoding="utf-8") as fh:
         # Written rather than set afterwards so that load_latest_preview, which
         # __init__ calls, looks in the temp folder and not in the real one.
-        fh.write('{"outdir": %r, "dated": false, "title": "sr760"}'
-                 % outdir.replace("\\", "\\\\"))
+        # json.dumps, not %r: a Python repr of a Windows path is not JSON, and
+        # load_config would quietly reject the file and leave the default
+        # output folder - the user's real one - in place.
+        json.dump({"outdir": outdir, "dated": False, "title": "sr760"}, fh)
     root = tk.Tk()
     root.withdraw()
     # __init__ schedules a pump for 100 ms and an auto-connect for 300 ms. Every
@@ -536,6 +539,157 @@ ok("... the slipped range is one of them", "-20 dBV" in quality)
 ok("... the overload is another", "overload flagged" in quality)
 ok("... and the vector averaging is the third", "vector" in quality)
 
+
+# --------------------------------------------- 8. what a sweep will cost
+
+print("\n--- capture_time ---")
+
+T_REC = S.record_time(11)                       # 1.0256 s at the 390 Hz span
+ok("the record length is bins/span", abs(T_REC - 400 / 390.0) < 1e-9,
+   f"{T_REC:.4f} s")
+# The figure the protocol was costed against, and the one plan_set computes:
+# settle + NAVG * T_rec + transfer, exact because the preset sets OVLP 0.
+plain = S.capture_time(11, navg=100, ovlp=0, settle_recs=5.0, transfer_s=1.5)
+ok("a capture is settle + NAVG*T_rec + transfer",
+   abs(plain - (5 * T_REC + 100 * T_REC + 1.5)) < 1e-6,
+   f"{plain:.1f} s = {S.fmt_hms(plain)}")
+ok("100 averages at the 390 Hz span is the ~102 s the protocol was costed at",
+   abs(100 * T_REC - 102.6) < 0.5)
+
+# Overlapping records arrive faster. capture_time can only put a floor under
+# it - the analyzer still has to finish an FFT between them - so the sweep
+# rescales against its own runs rather than trusting this.
+half = S.capture_time(11, navg=100, ovlp=50, settle_recs=5.0, transfer_s=1.5)
+deep = S.capture_time(11, navg=100, ovlp=90, settle_recs=5.0, transfer_s=1.5)
+ok("overlap shortens the estimate", plain > half > deep,
+   f"0% {plain:.0f}s, 50% {half:.0f}s, 90% {deep:.0f}s")
+ok("90% overlap is about a tenth of the averaging",
+   abs((deep - 5 * T_REC - 1.5) - (T_REC + 99 * T_REC * 0.1)) < 1e-6)
+ok("an overlap of 100 does not divide by zero",
+   np.isfinite(S.capture_time(11, navg=100, ovlp=100)))
+
+# An average with no finish of its own runs for the exponential wait, which is
+# exactly what run_one will sit out for it.
+expo = S.capture_time(11, navg=100, averaged=False, exp_wait_s=30.0,
+                      settle_recs=5.0, transfer_s=1.5)
+ok("an exponential average is priced at the exponential wait",
+   abs(expo - (5 * T_REC + 30.0 + 1.5)) < 1e-6, f"{expo:.1f} s")
+ok("so is averaging switched off",
+   S.capture_time(11, navg=None, exp_wait_s=30.0) == S.capture_time(
+       11, navg=100, averaged=False, exp_wait_s=30.0))
+
+# 100 averages at the 191 mHz span is 58 hours; the measurement timeout is what
+# actually stops it, so the estimate has to stop there too.
+capped = S.capture_time(0, navg=100, timeout_s=600.0, transfer_s=1.5)
+ok("the measurement timeout caps the estimate", capped < 602.0,
+   f"{S.fmt_hms(capped)}, uncapped it would be "
+   f"{S.fmt_hms(S.capture_time(0, navg=100, transfer_s=1.5))}")
+ok("an unknown span gives NaN, not a guess",
+   not np.isfinite(S.capture_time(None, navg=100)))
+ok("... and reads as a question mark", S.fmt_hms(float("nan")) == "?")
+
+print("\n--- fmt_hms ---")
+
+# The same three the run_protocol suite pins, because that copy and this one
+# have to go on agreeing - the planner cannot import this module.
+ok("seconds", S.fmt_hms(12.3) == "12.3s", S.fmt_hms(12.3))
+ok("minutes", S.fmt_hms(102.6) == "1m43s", S.fmt_hms(102.6))
+ok("hours", S.fmt_hms(7000) == "1h56m", S.fmt_hms(7000))
+ok("a round minute keeps its seconds", S.fmt_hms(120) == "2m00s")
+
+print("\n--- the estimate as a sweep runs ---")
+
+plan = [100.0] * 10
+line = sg.App.eta(plan, 0, 0.0)
+ok("before the first run the whole plan is left", "16m40s" in line, line)
+ok("... and it says it is an estimate", "(estimated)" in line)
+ok("... and counts from one", line.startswith("run 1/10"))
+
+# Runs coming in exactly on plan must leave the plan alone.
+line = sg.App.eta(plan, 5, 500.0)
+ok("runs landing on plan leave the estimate alone", "8m20s" in line, line)
+ok("... and the run counter moves", line.startswith("run 6/10"))
+
+# Was: scale = measured/planned applied whole, so one instant run against a
+# 100 s plan reported "about 0.0s left" with fifteen minutes still to go.
+line = sg.App.eta(plan, 1, 0.0)
+ok("one freak-fast run does not collapse the estimate",
+   "0.0s left" not in line, line)
+ok("... it is pulled by a third, not all the way",
+   abs(sum(plan[1:]) * (2 / 3.0) - 600.0) < 1e-6)
+
+# But a genuinely slow sweep must still be believed once there is evidence. Two
+# runs left is 3m20s on the plan; at eight runs of evidence that it goes at half
+# speed the correction carries 8/10 of the answer, so 200 s * (0.8*2 + 0.2).
+slow = sg.App.eta(plan, 8, 1600.0)          # twice as slow as planned
+ok("a consistently slow sweep is believed by the eighth run",
+   "6m00s" in slow, slow + "   (the raw plan says 3m20s)")
+ok("... and by then it is most of the way to the full correction",
+   abs(sum(plan[8:]) * (0.8 * 2 + 0.2) - 360.0) < 1e-6)
+ok("a NaN plan degrades to just the counter",
+   sg.App.eta([float("nan")] * 3, 0, 0.0) == "run 1/3",
+   sg.App.eta([float("nan")] * 3, 0, 0.0))
+
+print("\n--- sweep_plan ---")
+
+root, app = build_app()
+app.settle_recs.set("5")
+app.settle_s.set("0")
+app.binary.set(True)
+app.do_arng.set(False)
+plan = app.sweep_plan(["a", "b"], [0.0, 1.0, 2.0], [11, 12])
+ok("one entry per run, in the order the loop walks them", len(plan) == 12,
+   str(len(plan)))
+ok("span is the innermost axis, as the loop has it",
+   plan[0] == plan[2] == plan[4] and plan[0] != plan[1],
+   f"{plan[0]:.1f}, {plan[1]:.1f}")
+ok("a narrower span costs more", plan[0] > plan[1],
+   f"span 11 {plan[0]:.1f}s vs span 12 {plan[1]:.1f}s")
+ok("the settle is counted when the sweep writes a span",
+   abs(plan[0] - S.capture_time(11, navg=100, ovlp=0, settle_recs=5.0,
+                                timeout_s=600.0,
+                                transfer_s=S.TRANSFER_BINARY_S)) < 1e-6)
+# Nothing is written, so nothing has to settle.
+flat = app.sweep_plan([""], [None], [None])
+ok("no settle when the sweep leaves span and start alone",
+   abs(flat[0] - S.capture_time(11, navg=100, ovlp=0, settle_recs=0.0,
+                                timeout_s=600.0,
+                                transfer_s=S.TRANSFER_BINARY_S)) < 1e-6,
+   f"{flat[0]:.1f} s")
+app.binary.set(False)
+ok("the ASCII readout is priced as the slow one it is",
+   app.sweep_plan([""], [None], [None])[0] - flat[0]
+   == S.TRANSFER_ASCII_S - S.TRANSFER_BINARY_S,
+   f"{app.sweep_plan([''], [None], [None])[0] - flat[0]:.1f} s more")
+app.binary.set(True)
+root.destroy()
+
+# The span has to come from somewhere. When the sweep does not name one and the
+# analyzer will not say, there is no estimate to give.
+root, app = build_app(snap={k: v for k, v in GOOD.items() if k != "SPAN"})
+ok("no span from either side means no estimate",
+   app.sweep_plan([""], [None], [None]) == [])
+ok("... but a sweep that names its spans needs no help",
+   len(app.sweep_plan([""], [None], [11, 12])) == 2)
+root.destroy()
+
+print("\n--- the sweep logs it ---")
+
+root, app = build_app()
+app.save_csv.set(False), app.save_png.set(False), app.save_txt.set(False)
+app.save_npy.set(False), app.combined.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+clear_log(app)
+app._grab_runs([""], [0.0, 1.0, 2.0], [11])
+root.update()
+log = logged(app)
+ok("the sweep says what it will cost before it starts",
+   "about 5m28s of measuring" in log,
+   " ".join(log.split())[:88])
+ok("... and when it expects to finish", "finishing around" in log)
+ok("every run carries a countdown", log.count(" left, done ~") == 3)
+ok("the first is flagged as an estimate", "(estimated)" in log)
+root.destroy()
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

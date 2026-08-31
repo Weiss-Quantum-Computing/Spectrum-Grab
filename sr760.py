@@ -59,6 +59,7 @@ __all__ = [
     "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
     "record_stats", "stats_notes", "averaging_fault", "readout_fault",
     "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
+    "TRANSFER_BINARY_S", "TRANSFER_ASCII_S", "fmt_hms", "capture_time",
 ]
 
 DEFAULT_ADDRESS = "GPIB0::10::INSTR"
@@ -635,6 +636,76 @@ def record_time(span_code, n_bins=N_BINS):
     rather than in seconds."""
     hz = span_hz(span_code) if span_code is not None else float("nan")
     return n_bins / hz if hz and np.isfinite(hz) and hz > 0 else float("nan")
+
+
+# Per-capture overheads, seconds. Estimates for the clock only - nothing at run
+# time is derived from them, and a sweep corrects them against its own measured
+# runs as it goes. TRANSFER_BINARY_S is the figure run_protocol.plan_set costs a
+# trace at; the ASCII one is 800 queries bin by bin, which is the two orders of
+# magnitude the fast dump exists to avoid.
+TRANSFER_BINARY_S = 1.5
+TRANSFER_ASCII_S = 25.0
+
+
+def fmt_hms(seconds):
+    """Seconds as the shortest honest thing to read.
+
+    The same function run_protocol carries. Duplicated rather than shared for
+    the reason its SPAN table is: the planner has to cost a bench session on a
+    machine with no instrument code, so it cannot import this module."""
+    if not np.isfinite(seconds):
+        return "?"
+    s = int(round(seconds))
+    if s < 60:
+        return f"{seconds:.1f}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def capture_time(span_code, navg=None, ovlp=None, averaged=True,
+                 settle_recs=0.0, extra_settle_s=0.0, autorange_s=0.0,
+                 exp_wait_s=0.0, timeout_s=None,
+                 transfer_s=TRANSFER_BINARY_S, n_bins=N_BINS):
+    """How long one capture should take, in seconds. NaN if the span is unknown.
+
+    Everything is in record lengths, because that is the only clock the
+    analyzer has: T_rec = bins/span is 4 ms at the 100 kHz span and 35 minutes
+    at 191 mHz, so nothing here can be quoted in seconds without knowing which
+    span it is on.
+
+        settle      recs * T_rec, the decimation chain flushing
+        average     T_rec + (N-1)*(1-overlap)*T_rec
+        transfer    a flat figure, and the smaller term by far
+
+    At OVLP 0 the averaging term is NAVG * T_rec exactly, which is the same
+    arithmetic run_protocol.plan_set does and the reason the protocol preset
+    sets no overlap: the plan, the clock and record_stats then all agree.
+
+    With overlap it is a floor rather than an estimate. Records that share
+    samples arrive faster in principle, but the analyzer has to finish an FFT
+    between them, and at wide spans that is what limits it rather than the
+    acquisition - so the real run lands somewhere between this and the
+    no-overlap figure. A sweep does not have to care, because it rescales what
+    is left against the runs it has actually timed.
+
+    An average with no finish of its own - exponential, or averaging off - is
+    not counted in records at all: it runs for exp_wait_s, because that is what
+    the panel will wait. `timeout_s` caps the estimate the way the measurement
+    timeout caps the wait.
+    """
+    t_rec = record_time(span_code, n_bins)
+    if not np.isfinite(t_rec):
+        return float("nan")
+    if averaged and navg:
+        share = min(max(float(ovlp or 0.0) / 100.0, 0.0), 0.99)
+        measure = t_rec + (float(navg) - 1.0) * t_rec * (1.0 - share)
+    else:
+        measure = float(exp_wait_s or 0.0)
+    if timeout_s:
+        measure = min(measure, float(timeout_s))
+    return (float(settle_recs) * t_rec + float(extra_settle_s)
+            + float(autorange_s) + measure + float(transfer_s))
 
 
 def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS,
