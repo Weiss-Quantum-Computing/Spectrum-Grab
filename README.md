@@ -14,9 +14,34 @@ you get, in your chosen folder:
 | `<name>.txt` | Metadata: span, start frequency, window, averaging, input range and every other setting, each with the command that would put it back |
 
 The panel shows the most recent plot inline; double-click it to open the
-full-resolution PNG. **Peek** draws the trace into that same box without
-writing anything, and **Start average** restarts the average and waits it out
-without writing anything either - so looking is never the same as collecting.
+full-resolution PNG, or press **Zoom / pan** for an interactive copy you can
+zoom into. **Peek** draws the trace into the preview box without writing
+anything, and **Start average** restarts the average and waits it out without
+writing anything either - so looking is never the same as collecting.
+
+## Zoom and pan
+
+**Zoom / pan** under the preview opens the last plot in a window of its own,
+with matplotlib's navigation toolbar: rectangle zoom, pan, back, forward, Home
+and Save, the same set the ILC panel has. The toolbar prints the cursor's
+frequency and amplitude as you move, which is the quickest way to put a number
+on a peak.
+
+It is drawn from the trace data rather than from the PNG, through the same
+drawing code the PNG goes through - so what you zoom into differs from the file
+on disk in nothing but the axis limits, log axis and settings line included. A
+window rather than the preview box for two reasons: a spectrum is worth looking
+at large, and the preview has to go on showing PNGs this session did not draw,
+which have no trace data behind them to redraw from.
+
+**follow new captures** is ticked by default, so a grab, a sweep step or a peek
+replaces what is on screen. Untick it to hold a zoomed view while a sweep or an
+auto-grab runs. While following, a new capture resets the view - including the
+toolbar's history, since going Home to the previous capture's limits would mean
+nothing.
+
+The window needs matplotlib's Tk backend. A Python that has matplotlib but not
+that still saves plots and shows the preview; the button just says so.
 
 ## Requirements
 

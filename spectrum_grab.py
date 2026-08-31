@@ -44,6 +44,18 @@ try:
 except ImportError:                       # everything but the plots still works
     Figure = None
 
+# The zoom window is the one plot that is not a file: a live Tk canvas with
+# matplotlib's own navigation toolbar behind it. Imported separately because the
+# Agg backend above is what lets the saved plots be drawn off the main thread,
+# and that has to go on being true - this canvas is touched by the main thread
+# only. A Python with matplotlib but no Tk backend still saves plots; it just
+# cannot zoom.
+try:
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                   NavigationToolbar2Tk)
+except ImportError:
+    FigureCanvasTkAgg = NavigationToolbar2Tk = None
+
 # Remembered between sessions: folder, title, sweep lists, acquisition options.
 # Kept out of the program folder so a git pull cannot clobber it.
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
@@ -671,19 +683,19 @@ def wrap_notes(bits, width=SUBTITLE_WRAP):
     return "\n".join(lines)
 
 
-def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
-              dpi=PLOT_DPI, yscale="linear"):
-    """Draw one or more traces to a PNG. `path` may be a file object, which is
-    how the peek keeps its picture out of the file system.
+def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
+                yscale="linear"):
+    """Draw one or more traces onto an existing axes.
 
     Titling is two lines: what the capture is, then the handful of settings that
     decide what the trace means. The default y window is kept unless the data
     falls outside it, and the second line says so when it had to be widened - so
     a plot that looks unlike the others is flagged rather than silently
-    rescaled. Linear traces are left to autoscale."""
-    fig = Figure(figsize=(8, 6))
-    FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    rescaled. Linear traces are left to autoscale.
+
+    Split out from save_plot so the zoom window draws through the same code: a
+    plot you have zoomed into and the PNG on disk should differ in nothing but
+    the axis limits."""
     for freqs, amps, label in traces:
         ax.plot(freqs, amps, lw=1.2, label=label,
                 color="blue" if len(traces) == 1 else None)
@@ -727,6 +739,16 @@ def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
     ax.grid(True)
     if legend and 1 < len(traces) <= 12:
         ax.legend(fontsize=9)
+
+
+def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
+              dpi=PLOT_DPI, yscale="linear"):
+    """The same plot as a PNG. `path` may be a file object, which is how the
+    peek keeps its picture out of the file system."""
+    fig = Figure(figsize=(8, 6))
+    FigureCanvasAgg(fig)
+    draw_traces(fig.add_subplot(111), traces, title, subtitle, ylabel,
+                ymin, ymax, legend, yscale)
     fig.tight_layout()
     fig.savefig(path, format="png", dpi=dpi)
 
@@ -773,6 +795,12 @@ class App:
         self.auto_job = None
         self.dead = {}            # setting key -> consecutive query failures
         self.qform = {}           # setting key -> index of the query form that works
+        # What was drawn last, kept so the zoom window can redraw it from the
+        # data rather than from the PNG: (traces, title, subtitle, ylabel,
+        # yscale). None until the first grab or peek of the session.
+        self.last_plot = None
+        self.zoom_win = self.zoom_fig = self.zoom_ax = None
+        self.zoom_canvas = self.zoom_tb = None
 
         root.title("Spectrum Grab - SR760 FFT")
         win_w = min(1180, root.winfo_screenwidth() - 60)
@@ -1005,6 +1033,15 @@ class App:
         self.preview_img = None
         self.preview_path = None
 
+        row = ttk.Frame(self.shot_frame)
+        row.pack(fill="x", padx=6, pady=(0, 6))
+        self.zoom_btn = ttk.Button(row, text="Zoom / pan...",
+                                   command=self.open_zoom, state="disabled")
+        self.zoom_btn.pack(side="left")
+        self.zoom_follow = tk.BooleanVar(value=True)
+        ttk.Label(row, text="double-click the plot for the saved PNG",
+                  foreground="#666").pack(side="left", padx=8)
+
     def build_settings(self, parent, pad):
         self.set_vars = {}        # key -> StringVar shown in the panel
         self.set_marks = {}       # key -> "edited" marker label
@@ -1177,6 +1214,97 @@ class App:
         self.preview_path = None
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.shot_frame.configure(text=f"Peek at {stamp} - not saved")
+
+    # -- zoom window ------------------------------------------------------
+
+    def remember_plot(self, traces, title, subtitle, ylabel, yscale):
+        """Keep what was just drawn so the zoom window can rebuild it from the
+        data. Called from the worker threads, so the window itself is only
+        touched by way of the main loop."""
+        self.last_plot = (traces, title, subtitle, ylabel, yscale)
+        self.root.after(0, self.plot_arrived)
+
+    def plot_arrived(self):
+        """Main thread. A new plot exists, so zooming is now possible; redraw an
+        open window if it is following."""
+        self.zoom_btn.configure(state="normal")
+        if self.zoom_follow.get():
+            self.draw_zoom()
+
+    def zoom_open(self):
+        return self.zoom_win is not None and self.zoom_win.winfo_exists()
+
+    def open_zoom(self):
+        """An interactive copy of the last plot in a window of its own, with
+        matplotlib's navigation toolbar: rectangle zoom, pan, back, forward,
+        Home and Save, the same set the ILC panel has.
+
+        A window rather than the preview box, for two reasons. A spectrum is
+        worth looking at large, and the preview has to go on showing PNGs this
+        session did not draw - the newest file in the folder at startup has no
+        trace data behind it to redraw from."""
+        if Figure is None or FigureCanvasTkAgg is None:
+            self.log("Zoom needs matplotlib with its Tk backend, which this "
+                     "Python does not have.")
+            return
+        if self.last_plot is None:
+            self.log("Nothing plotted yet - grab or peek first.")
+            return
+        if self.zoom_open():
+            self.zoom_win.deiconify()
+            self.zoom_win.lift()
+            self.draw_zoom()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Spectrum Grab - zoom")
+        win.geometry("980x720")
+        fig = Figure(figsize=(9, 6.4), dpi=100)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+
+        # Anything of a fixed height has to be packed before the canvas: the
+        # canvas expands into whatever cavity is left when it is packed, and
+        # packing it first leaves the toolbar nothing to sit in.
+        bar = ttk.Frame(win)
+        bar.pack(side="bottom", fill="x")
+        ttk.Checkbutton(bar, text="follow new captures",
+                        variable=self.zoom_follow).pack(side="left", padx=6,
+                                                        pady=3)
+        ttk.Label(bar, text="untick to hold this view while a sweep or an "
+                            "auto-grab runs", foreground="#666").pack(
+            side="left", padx=4)
+        self.zoom_tb = NavigationToolbar2Tk(canvas, win)
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        self.zoom_win, self.zoom_fig, self.zoom_canvas = win, fig, canvas
+        self.zoom_ax = fig.add_subplot(111)
+        win.protocol("WM_DELETE_WINDOW", self.close_zoom)
+        self.draw_zoom()
+
+    def close_zoom(self):
+        win, self.zoom_win = self.zoom_win, None
+        self.zoom_fig = self.zoom_ax = self.zoom_canvas = self.zoom_tb = None
+        if win is not None:
+            win.destroy()
+
+    def draw_zoom(self):
+        """Main thread. Redraw the zoom window from the last plot, through the
+        same drawing code the PNG goes through."""
+        if not self.zoom_open() or self.last_plot is None:
+            return
+        traces, title, subtitle, ylabel, yscale = self.last_plot
+        self.zoom_ax.clear()
+        try:
+            draw_traces(self.zoom_ax, traces, title, subtitle, ylabel,
+                        *self.y_window(ylabel), yscale=yscale)
+            self.zoom_fig.tight_layout()
+            self.zoom_canvas.draw_idle()
+        except Exception as exc:
+            self.log(f"  (zoom redraw failed: {exc})")
+            return
+        # The view stack belonged to the trace that has just been replaced, so
+        # Home would otherwise go back to the previous capture's limits.
+        self.zoom_tb.update()
 
     def load_latest_preview(self):
         outdir = self.target_dir()
@@ -1820,6 +1948,7 @@ class App:
         buf = io.BytesIO()
         save_plot(buf, traces, title, subtitle, ylabel, *self.y_window(ylabel),
                   dpi=PEEK_DPI, yscale=yscale)
+        self.remember_plot(traces, title, subtitle, ylabel, yscale)
         return buf.getvalue()
 
     def write_plot(self, path, traces, title, subtitle, ylabel,
@@ -1834,6 +1963,7 @@ class App:
             self.log(f"  (plot failed: {exc})")
             return
         self.log(f"  {os.path.basename(path)}")
+        self.remember_plot(traces, title, subtitle, ylabel, yscale)
         self.root.after(0, lambda p=path: self.show_preview(p))
 
     def save_sweep(self, outdir, stamp, cases, starts, spans, freqs_m, amps_m,
