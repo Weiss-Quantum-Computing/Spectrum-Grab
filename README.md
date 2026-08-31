@@ -99,6 +99,78 @@ GPIB resource instead and take the first one that identifies as an SR760.
 - **Stop** - ends a sweep after the step in progress and releases the front
   panel. It also ends a Start average wait and a peek's bin-by-bin readout.
 
+## Range hold
+
+A locked-range measurement set is one where the comparison IS the result: dark
+against light, resistor against resistor, segment A against segment B. Auto
+range moves the input range whenever the signal asks it to, and a range step is
+a step in the noise floor, so those pairs end up differing by the ranging as
+much as by the physics with nothing in the files to say which.
+
+**Range hold** arms once and stays armed across as many grabs as the set takes:
+
+- **Auto-range and pin** runs the ranging routine, then pins whatever it settled
+  on. **Pin as-is** pins the range that is already set, which is what you want
+  when it was chosen by hand at the front panel - the usual case for a segmented
+  measurement where each band sits just under overload.
+- While held, every capture re-asserts `ARNG 0` and the pinned `IRNG` before
+  measuring. That is not belt and braces: the front panel can put auto range
+  back, and so can a Defaults apply.
+- After the average and **before the trace is written**, the range is read back
+  and compared. A range that moved makes the trace `SUSPECT` in the metadata and
+  on the plot, rather than saving it as clean. So does a range that could not be
+  read back at all - unverified is not the same as verified.
+- **Release** stops holding. It does not move the range; it only stops pinning
+  and checking it.
+
+`SCRIPT_DEFAULTS` ships `ARNG:0` for the same reason. The bench scripts shipped
+`ARNG:1`; that is right for a survey and wrong for every comparison.
+
+## What a run is worth
+
+`NAVG` counts records the analyzer averaged, not independent ones. With `OVLP`
+above zero the records share samples, so they carry less information than their
+count suggests. The metadata now records what the error bar actually rests on:
+
+```
+record length T_rec (s)   : 1.026        # bins / span
+independent records       : 117.0        # elapsed / T_rec
+relative error (1 sigma)  : 0.0925       # 1 / sqrt(N_indep)
+relative error (dB)       : 0.38
+averages reported (NAVG)  : 1000
+NAVG / independent        : 8.55  <- NAVG overstates the statistics
+overlap (%)               : 90
+```
+
+At 90% overlap, 1000 averages in 120 s are worth 117 - the reported figure
+overstates the statistics eight-fold. The 1-sigma figure also goes on the plot,
+so a segment carries its own error bar into the comparison with its neighbour.
+
+## Settling
+
+**settle (record lengths)**, default 5, waits after any change of span, start
+frequency, range or coupling before averaging starts, and the value used goes in
+the metadata. It is in record lengths because that is what the analyzer's
+settling scales with: at the 191 mHz span a record is 35 minutes and at 100 kHz
+it is 4 ms, so a fixed number of seconds is either uselessly long at one end or
+no wait at all at the other.
+
+This is not what `wait_ready()` does. That waits for the analyzer to answer a
+query again, which it does perfectly happily while its decimation filters are
+still full of the previous span's data. **settle before start (s)** is still
+there and is added on top, unconditionally.
+
+## Overload
+
+The error status byte is read straight after every averaging run, before
+anything else can clear it, and `overload` goes in the metadata. An overload
+here need not show on the trace at all: the input stage sees everything the
+anti-alias filter passes, so a servo bump at 150-300 kHz or RF on an
+unterminated line can saturate the front end while the displayed 0-100 kHz band
+looks perfectly clean. A trace taken through a saturated front end is not a
+measurement of anything, and nothing on the screen says so - which is why it is
+called out in the log, written to the metadata and printed on the plot.
+
 ## File names
 
 ```

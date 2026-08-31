@@ -88,6 +88,17 @@ READY_TIMEOUT_S = 45.0
 # itself, so reusing it means every such capture takes the whole ten minutes.
 DEFAULT_EXP_WAIT_S = 30.0
 
+# Settling after a change of span, start frequency, range or coupling, counted
+# in record lengths because that is the unit the analyzer's own settling is in:
+# the decimation filter chain has to flush, and how long that takes scales with
+# the record, not with the wall clock. wait_ready() is a different thing - it
+# waits for the analyzer to answer a query again, which it will do while its
+# filters are still full of the previous span's data.
+DEFAULT_SETTLE_RECS = 5.0
+
+# Writing any of these means the next average has to settle first.
+SETTLE_KEYS = ("SPAN", "STRF", "CTRF", "IRNG", "ARNG", "ICPL")
+
 # Plot window used unless the trace falls outside it, and only for dB traces -
 # a linear trace is autoscaled instead.
 DEFAULT_YMIN, DEFAULT_YMAX = -160.0, -20.0
@@ -223,7 +234,14 @@ BY_KEY = {s.key: s for s in ALL_SETTINGS}
 SCRIPT_DEFAULTS = {
     "SPAN": "11", "STRF": "0", "WNDO": "2",
     "MEAS0": "1", "DISP0": "0", "UNIT0": "1", "VOEU0": "0",
-    "ISRC": "0", "ICPL": "0", "IGND": "0", "ARNG": "1", "AOFM": "1",
+    # ARNG is 0, not the 1 the bench scripts shipped. Auto range moves the
+    # input range whenever the signal asks it to, and a range step is a step in
+    # the noise floor: dark against light, resistor against resistor, segment
+    # against segment then differ by the ranging as much as by the physics, and
+    # nothing in the files says which. Range it once with the Range hold panel
+    # and pin it. Turn it back to Auto here deliberately if you want a survey
+    # rather than a comparison.
+    "ISRC": "0", "ICPL": "0", "IGND": "0", "ARNG": "0", "AOFM": "1",
     "AVGO": "1", "NAVG": "1000", "AVGT": "0", "AVGM": "0",
     "ACTG": "0", "FMTS0": "0", "GRID0": "2", "FILS0": "0", "XAXS0": "0",
     "EXPD0": "5", "MRKR0": "2", "MRKW0": "0", "MRKM0": "0", "MRLK0": "0",
@@ -380,6 +398,68 @@ def span_hz(code):
     return SPANS[code][1] if 0 <= code < len(SPANS) else float("nan")
 
 
+def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS):
+    """How much independent averaging a run actually bought.
+
+    NAVG counts records the analyzer averaged, not independent ones. With OVLP
+    above zero the records share samples, so they carry less information than
+    their count suggests - at 90% overlap ten records hold about the same as
+    two, and the reported NAVG overstates the statistics several-fold. What the
+    error bar actually rests on is how long the run was in units of the record
+    length:
+
+        T_rec   = bins / span            the analyzer's own record length
+        N_indep = elapsed / T_rec        records that did not share samples
+        rel_err = 1 / sqrt(N_indep)      1-sigma on an RMS-averaged PSD bin
+
+    rel_err is the fractional error on the power in a bin, so a value of 0.1
+    is +/- 10%, about +/- 0.41 dB. It is the honest bar to put on a segment
+    before comparing it with its neighbour.
+
+    Returns a dict of plain numbers; NaN wherever the inputs do not support the
+    calculation rather than a guess."""
+    hz = span_hz(span_code) if span_code is not None else float("nan")
+    t_rec = n_bins / hz if hz and np.isfinite(hz) and hz > 0 else float("nan")
+    elapsed = float(elapsed_s)
+    n_indep = elapsed / t_rec if np.isfinite(t_rec) and t_rec > 0 else float("nan")
+    rel_err = (1.0 / np.sqrt(n_indep)
+               if np.isfinite(n_indep) and n_indep > 0 else float("nan"))
+    out = {"t_rec_s": t_rec, "elapsed_s": elapsed, "n_indep": n_indep,
+           "rel_err": rel_err, "navg": navg, "overlap_pct": ovlp}
+    # The ratio is the point of the whole calculation: it says how far NAVG is
+    # from what the run can actually support.
+    out["navg_over_indep"] = (navg / n_indep
+                              if navg and np.isfinite(n_indep) and n_indep > 0
+                              else float("nan"))
+    return out
+
+
+def stats_notes(stats):
+    """`record_stats` as the lines that go in the metadata file."""
+    def g(key, fmt="{:.4g}"):
+        v = stats.get(key)
+        return fmt.format(v) if isinstance(v, (int, float)) and np.isfinite(v) \
+            else "?"
+    notes = {
+        "record length T_rec (s)": g("t_rec_s"),
+        "independent records": g("n_indep", "{:.1f}"),
+        "relative error (1 sigma)": g("rel_err", "{:.3g}"),
+        "relative error (dB)": (f"{10 * np.log10(1 + stats['rel_err']):.2f}"
+                                if np.isfinite(stats.get("rel_err", np.nan))
+                                else "?"),
+    }
+    if stats.get("navg"):
+        notes["averages reported (NAVG)"] = f"{stats['navg']:g}"
+        ratio = stats.get("navg_over_indep", float("nan"))
+        if np.isfinite(ratio):
+            notes["NAVG / independent"] = (
+                f"{ratio:.2f}" + ("  <- NAVG overstates the statistics"
+                                  if ratio > 1.5 else ""))
+    if stats.get("overlap_pct") is not None:
+        notes["overlap (%)"] = f"{stats['overlap_pct']:g}"
+    return notes
+
+
 # ---------------------------------------------------------------------------
 # Instrument layer
 # ---------------------------------------------------------------------------
@@ -476,6 +556,46 @@ class Analyzer:
             return int(self.get("ERRS?"))
         except Exception:
             return 0
+
+    def overload(self):
+        """The two overload flags, as (ERRS bit 7, FFTS bit 5), None where the
+        analyzer would not answer.
+
+        Worth reading after every average, not just while ranging. The input
+        stage sees the whole band the anti-alias filter passes, so content
+        outside the span can overload it while the displayed 0-100 kHz trace
+        looks perfectly clean - a servo bump at 150-300 kHz, or RF picked up on
+        an unterminated line, do exactly that. A trace taken through a
+        saturated front end is not a measurement of anything, and nothing on
+        the screen says so.
+
+        Reading clears the byte, so call this once, straight after the run,
+        before anything else has a chance to clear it."""
+        out = []
+        for query in ("ERRS?7", "FFTS?5"):
+            try:
+                out.append(int(self.get(query)))
+            except Exception:
+                self.recover()
+                out.append(None)
+        return tuple(out)
+
+    def pin_range(self, dbv):
+        """Put the input range on manual and hold it at `dbv`.
+
+        ARNG has to go to manual first: writing IRNG while auto range is on
+        sets a value the analyzer is free to move off again on the next
+        overload, which is the whole failure this exists to stop."""
+        self.put("ARNG 0")
+        self.put(f"IRNG {dbv:g}")
+
+    def input_range(self):
+        """The range the analyzer says it is on, as a float, or None."""
+        try:
+            return float(self.get("IRNG?"))
+        except Exception:
+            self.recover()
+            return None
 
     def lock_panel(self, locked):
         """OVRM 0 locks the front panel for the duration of a measurement, so a
@@ -801,6 +921,14 @@ class App:
         self.last_plot = None
         self.zoom_win = self.zoom_fig = self.zoom_ax = None
         self.zoom_canvas = self.zoom_tb = None
+        # Range hold: the input range a measurement set is pinned to, and when
+        # it was armed. None means no set is being held. It deliberately
+        # outlives one press of GRAB - dark against light, or resistor against
+        # resistor, are separate acquisitions that only compare if they were
+        # taken on the same range.
+        self.pinned_range = None
+        self.pinned_at = ""
+        self.settle_due = threading.Event()
 
         root.title("Spectrum Grab - SR760 FFT")
         win_w = min(1180, root.winfo_screenwidth() - 60)
@@ -820,6 +948,7 @@ class App:
         self.build_grab(left, pad)
         self.build_sweep(left, pad)
         self.build_options(left, pad)
+        self.build_hold(left, pad)
         self.build_log(left, pad)
         self.build_preview(right, pad)
         self.build_settings(right, pad)
@@ -999,13 +1128,12 @@ class App:
         grid.pack(fill="x", padx=6, pady=(2, 6))
         for i, item in enumerate(
                 (("settle before start (s)", "settle_s", "0"),
+                 ("settle (record lengths)", "settle_recs",
+                  f"{DEFAULT_SETTLE_RECS:g}"),
                  ("measurement timeout (s)", "timeout_s", "600"),
                  ("exponential wait (s)", "exp_wait_s", f"{DEFAULT_EXP_WAIT_S:g}"),
-                 None,                  # keeps the plot window on a row of its own
                  ("plot y min (dB)", "ymin", f"{DEFAULT_YMIN:g}"),
                  ("plot y max (dB)", "ymax", f"{DEFAULT_YMAX:g}"))):
-            if item is None:
-                continue
             label, attr, default = item
             r, c = divmod(i, 2)
             ttk.Label(grid, text=label + ":").grid(row=r, column=c * 2,
@@ -1014,6 +1142,41 @@ class App:
             setattr(self, attr, var)
             ttk.Entry(grid, textvariable=var, width=8).grid(
                 row=r, column=c * 2 + 1, sticky="w", padx=(0, 12), pady=1)
+
+    def build_hold(self, parent, pad):
+        """Range hold: one autorange for a whole measurement set, then the range
+        pinned for every trace in it.
+
+        A set here is not one press of GRAB. Dark against light, resistor
+        against resistor, range-step A against range-step B are separate
+        acquisitions whose whole content is the difference between them, and
+        that difference only means anything if the input range did not move
+        underneath it. So the hold is armed once, by hand, and stays armed
+        across as many grabs as the set takes."""
+        f = ttk.LabelFrame(parent, text="Range hold  (one range for a whole "
+                                        "measurement set)")
+        f.pack(fill="x", **pad)
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(row, text="Set:").pack(side="left")
+        self.set_name = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.set_name, width=18).pack(side="left",
+                                                                  padx=6)
+        self.arm_btn = ttk.Button(row, text="Auto-range and pin",
+                                  command=self.do_arm_hold, state="disabled")
+        self.arm_btn.pack(side="left", padx=4)
+        self.pin_btn = ttk.Button(row, text="Pin as-is",
+                                  command=lambda: self.do_arm_hold(rerange=False),
+                                  state="disabled")
+        self.pin_btn.pack(side="left", padx=2)
+        self.release_btn = ttk.Button(row, text="Release",
+                                      command=self.do_release_hold,
+                                      state="disabled")
+        self.release_btn.pack(side="left", padx=4)
+        self.hold_status = ttk.Label(f, text="not held - the analyzer is free "
+                                             "to move its own range",
+                                     foreground="#c60")
+        self.hold_status.pack(anchor="w", padx=10, pady=(0, 6))
 
     def build_log(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Log")
@@ -1144,8 +1307,9 @@ class App:
         state = "disabled" if busy or not self.an.inst else "normal"
         for btn in (self.grab_btn, self.avg_btn, self.peek_btn, self.read_btn,
                     self.apply_btn, self.aoff_btn, self.auts_btn,
-                    self.arng_chk):
+                    self.arng_chk, self.arm_btn, self.pin_btn):
             btn.configure(state=state)
+        self.refresh_hold()
         # Connect is the one button that means something while disconnected.
         self.connect_btn.configure(state="disabled" if busy else "normal")
         self.stop_btn.configure(state="normal" if busy else "disabled")
@@ -1337,6 +1501,7 @@ class App:
             "binary": self.binary, "lock": self.lock, "autorange": self.do_arng,
             "autorange_s": self.arng_s, "settle_s": self.settle_s,
             "timeout_s": self.timeout_s, "exp_wait_s": self.exp_wait_s,
+            "settle_recs": self.settle_recs, "set_name": self.set_name,
             "ymin": self.ymin, "ymax": self.ymax,
             "interval": self.interval,
         }
@@ -1548,6 +1713,151 @@ class App:
         self.do_action(f"auto range {'on' if on else 'off'}",
                        lambda: self.an.put(f"ARNG {1 if on else 0}"))
 
+    # -- range hold -------------------------------------------------------
+
+    def do_arm_hold(self, rerange=True):
+        """Arm the hold: optionally auto-range first, then pin whatever range
+        the analyzer ends up on.
+
+        `rerange=False` pins the range that is already set, which is what you
+        want when the range was chosen by hand at the front panel - the usual
+        case for a segmented measurement where each band has its own range
+        picked to sit just under overload."""
+        if self.busy or not self.an.inst:
+            return
+        self.abort.clear()
+        self.set_busy(True)
+        threading.Thread(target=self._arm_worker, args=(rerange,),
+                         daemon=True).start()
+
+    def _arm_worker(self, rerange):
+        try:
+            if rerange:
+                seconds = self.float_of(self.arng_s, 15.0, "auto-range time")
+                self.log(f"Range hold: auto-ranging for {seconds:g} s...")
+                rng, overloads, polls = self.an.autorange(
+                    seconds, stop=self.abort.is_set)
+                self.log(f"  settled at {rng} dBV (overload on "
+                         f"{overloads}/{polls} polls)")
+            found = self.an.input_range()
+            if found is None:
+                self.log("ERROR: the analyzer would not report IRNG, so there "
+                         "is nothing to pin to.")
+                return
+            self.an.pin_range(found)
+            # Read it back rather than trusting the write: the analyzer clamps
+            # a range it dislikes and says nothing about having done so.
+            got = self.an.input_range()
+            if got is not None and got != found:
+                self.log(f"  (asked to pin {found:g} dBV, the analyzer reports "
+                         f"{got:g} dBV - pinning that instead)")
+                found = got
+            self.pinned_range = found
+            self.pinned_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.settle_due.set()
+            name = self.set_name.get().strip()
+            self.log(f"Range held at {found:g} dBV"
+                     + (f" for set '{name}'" if name else "")
+                     + " - ARNG is now manual and every trace will be checked "
+                       "against it.")
+            values = self.read_all_settings()
+            self.root.after(0, lambda v=values: self.show_settings(v))
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            self.an.recover()
+        finally:
+            self.root.after(0, self.refresh_hold)
+            self.root.after(0, lambda: self.set_busy(False))
+
+    def do_release_hold(self):
+        """Stop holding. The analyzer is left exactly where it is - releasing
+        the hold is not a reason to move the range, only to stop checking it."""
+        self.pinned_range = None
+        self.pinned_at = ""
+        self.log("Range hold released. The range is unchanged; it is simply no "
+                 "longer pinned or checked.")
+        self.refresh_hold()
+
+    def refresh_hold(self):
+        """Main thread. Keep the hold line and its buttons telling the truth."""
+        held = self.pinned_range is not None
+        name = self.set_name.get().strip()
+        if held:
+            self.hold_status.configure(
+                text=f"held at {self.pinned_range:g} dBV"
+                     + (f" for '{name}'" if name else "")
+                     + f", armed {self.pinned_at}",
+                foreground="#060")
+        else:
+            self.hold_status.configure(
+                text="not held - the analyzer is free to move its own range",
+                foreground="#c60")
+        self.release_btn.configure(state="normal" if held and not self.busy
+                                   else "disabled")
+
+    def check_hold(self, snap):
+        """Compare the range the run was actually taken on against the pin.
+
+        Called with the snapshot read straight after the average and before the
+        trace is transferred, so the answer describes the trace about to be
+        written rather than the state some time later. Returns the notes to
+        merge in, and whether the trace is clean."""
+        if self.pinned_range is None:
+            return {}, True
+        name = self.set_name.get().strip()
+        notes = {"range hold": f"{self.pinned_range:g} dBV"
+                               + (f", set '{name}'" if name else "")
+                               + f", armed {self.pinned_at}"}
+        raw = snap.get("IRNG")
+        if raw is None:
+            # IRNG is one of the settings that can go write-only after a run of
+            # timeouts. Unverified is not the same as clean and must not be
+            # written as though it were.
+            notes["trace quality"] = ("SUSPECT: the range could not be read "
+                                      "back, so the pin is unverified")
+            return notes, False
+        try:
+            got = float(raw)
+        except (TypeError, ValueError):
+            notes["trace quality"] = f"SUSPECT: IRNG answered {raw!r}"
+            return notes, False
+        if got != self.pinned_range:
+            notes["trace quality"] = (
+                f"SUSPECT: the range moved to {got:g} dBV from the pinned "
+                f"{self.pinned_range:g} dBV, so this trace does not compare "
+                f"with the rest of the set")
+            return notes, False
+        notes["trace quality"] = "clean: range verified against the pin"
+        return notes, True
+
+    # -- settling ---------------------------------------------------------
+
+    def settle_for(self, span_code):
+        """Wait out the decimation chain after a change of span, start
+        frequency, range or coupling, and say what was waited.
+
+        In record lengths, because that is what the analyzer's settling
+        actually scales with: at the 191 mHz span a record is 35 minutes and at
+        100 kHz it is 4 ms, and a fixed number of seconds is either uselessly
+        long at one end or no wait at all at the other. wait_ready() does not
+        cover this - the analyzer answers queries perfectly happily while its
+        filters are still full of the previous span's data."""
+        recs = self.float_of(self.settle_recs, DEFAULT_SETTLE_RECS,
+                             "settle record lengths")
+        t_rec = N_BINS / span_hz(span_code) if span_code is not None else float("nan")
+        if not (recs > 0) or not np.isfinite(t_rec):
+            self.settle_due.clear()
+            return {"settle": "none"}
+        seconds = recs * t_rec
+        self.log(f"  settling {recs:g} record lengths = {seconds:.3g} s "
+                 f"(T_rec {t_rec:.4g} s)")
+        state = self.wait_out(seconds)
+        self.settle_due.clear()
+        if state == "stopped":
+            raise KeyboardInterrupt
+        return {"settle": f"{recs:g} record lengths = {seconds:.4g} s "
+                          f"(T_rec {t_rec:.4g} s)"}
+
     def do_average(self):
         """Restart the average and wait it out, writing nothing.
 
@@ -1710,9 +2020,11 @@ class App:
                         # .10g, not %g: a stitch step is rarely a round number
                         # and 6 digits would shave a fraction of a bin off it.
                         self.an.put(f"STRF {start:.10g}")
+                        self.settle_due.set()
                     for isp, span in enumerate(spans):
                         if span is not None:
                             self.an.put(f"SPAN {span}")
+                            self.settle_due.set()
                         if self.abort.is_set():
                             raise KeyboardInterrupt
                         label = " ".join(
@@ -1763,7 +2075,17 @@ class App:
             self.an.lock_panel(True)
             self.log("  front panel locked")
         try:
-            if self.do_arng.get():
+            # The span is needed before the run, not after: the record length
+            # sets the settle and every statistic below rests on it.
+            span_code = code_of(self.read_settings("SPAN"), "SPAN")
+
+            if self.pinned_range is not None:
+                # Re-assert the pin every run. The analyzer will move its own
+                # range on an overload if anything has put ARNG back to auto -
+                # the front panel can, and so can a Defaults apply.
+                self.an.pin_range(self.pinned_range)
+                self.settle_due.set()
+            elif self.do_arng.get():
                 seconds = self.float_of(self.arng_s, 15.0, "auto-range time")
                 rng, overloads, polls = self.an.autorange(
                     seconds, stop=self.abort.is_set)
@@ -1771,9 +2093,14 @@ class App:
                                        f"overload on {overloads}/{polls} polls")
                 self.log(f"  auto-range done, range {rng} dBV "
                          f"(overload on {overloads}/{polls} polls)")
+                self.settle_due.set()
+
+            if self.settle_due.is_set():
+                notes.update(self.settle_for(span_code))
             settle = self.float_of(self.settle_s, 0.0, "settle")
             if settle > 0:
                 time.sleep(settle)
+                notes["extra settle (s)"] = f"{settle:g}"
             if self.abort.is_set():
                 # Stopped while ranging or settling: no point restarting the
                 # average just to abandon it on the first poll.
@@ -1813,12 +2140,47 @@ class App:
                 self.log(f"  measured in {measured:.1f} s")
             notes["measure time (s)"] = f"{measured:.3f}"
             notes["measurement"] = state
+
+            # Straight after the run and before anything else can clear the
+            # byte. An overload here need not show on the trace at all: the
+            # input stage sees everything the anti-alias filter passes, so
+            # out-of-band content saturates it while the displayed band looks
+            # clean.
+            errs, ffts = self.an.overload()
+            over = bool(errs) or bool(ffts)
+            notes["overload"] = ("YES - ERRS bit 7 "
+                                 f"{'set' if errs else 'clear'}, FFTS bit 5 "
+                                 f"{'set' if ffts else 'clear'}" if over else
+                                 "no" if errs is not None or ffts is not None
+                                 else "unread")
+            if over:
+                self.log("  *** OVERLOAD flagged during this run. The front end "
+                         "saturated; content outside the span can do that "
+                         "without showing on the trace. ***")
+
             self.an.autoscale()
 
             # Read the settings before the transfer: the display mode decides
             # whether the binary dump is valid, and the same snapshot goes in
             # the metadata and the panel.
             snap = self.read_all_settings()
+
+            # One verdict, listing every reason: an overload must not be hidden
+            # by a range that happened to hold, nor the other way round.
+            hold_notes, hold_ok = self.check_hold(snap)
+            notes.update(hold_notes)
+            faults = [] if hold_ok else [hold_notes["trace quality"]
+                                         .removeprefix("SUSPECT: ")]
+            if over:
+                faults.append("overload flagged during the run")
+            notes["trace quality"] = ("SUSPECT: " + "; ".join(faults) if faults
+                                      else hold_notes.get("trace quality",
+                                                          "clean"))
+            if faults:
+                self.log(f"  *** {notes['trace quality']} ***")
+            notes.update(stats_notes(record_stats(
+                code_of(snap, "SPAN", span_code), measured,
+                navg=code_of(snap, "NAVG"), ovlp=code_of(snap, "OVLP"))))
             binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:
                 self.log("  (linear display: falling back to the ASCII readout, "
@@ -1931,6 +2293,15 @@ class App:
         state = (notes or {}).get("measurement")
         if state and state != "done":
             bits.append(f"measurement {state}")
+        # An overload or a range that slipped its pin is invisible in the trace
+        # by construction, so the plot has to carry the warning or a suspect
+        # capture looks exactly like a good one.
+        quality = (notes or {}).get("trace quality", "")
+        if quality.startswith("SUSPECT"):
+            bits.append(quality)
+        err = (notes or {}).get("relative error (1 sigma)")
+        if err and err != "?":
+            bits.append(f"1 sigma {err}")
         bits.append(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         return SUBTITLE_SEP.join(bits)
 
@@ -2205,6 +2576,13 @@ class App:
                 for key, value in changes.items():
                     self.an.put(self.command(key, value))
                     self.log(f"  {self.command(key, value)}")
+                if any(k in SETTLE_KEYS for k in changes):
+                    # Span, start frequency, range or coupling: the filter chain
+                    # has to flush before the next average means anything.
+                    self.settle_due.set()
+                if "ARNG" in changes and self.pinned_range is not None:
+                    self.log("  (a range hold is armed - it will be re-asserted "
+                             "before the next capture, overriding this)")
                 self.report_status()
             # Read back either way: after a write the analyzer is the authority
             # on what it accepted, since it clamps values it dislikes.
