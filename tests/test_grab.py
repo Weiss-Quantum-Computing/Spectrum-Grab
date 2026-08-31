@@ -1449,6 +1449,44 @@ sent = an.write_settings({"SPAN": "11"})
 ok("a SPAN-only write puts the held OVLP back after the span",
    sent == ["SPAN 11", "OVLP 98.44"], str(sent))
 
+# Holding the overlap costs NAVG record lengths a trace; letting the span put
+# its own default back advances records 16 ms apiece. At NAVG 400 that is 27m40s
+# against 42 s at span 9, for 5 independent records instead of 400. Neither is
+# wrong - record_stats counts what arrived - so it is a dial, not a bug.
+an = OrderAn(held="0")
+sent = an.write_settings({"SPAN": "9"}, hold_resets=False)
+ok("hold_resets=False leaves the span default alone", sent == ["SPAN 9"],
+   str(sent))
+an = OrderAn(held="0")
+ok("... while the default still holds it",
+   an.write_settings({"SPAN": "9"}) == ["SPAN 9", "OVLP 0"])
+# The ordering is not part of the trade: an OVLP asked for explicitly is a
+# value someone typed, and it goes after the SPAN either way.
+an = OrderAn(held="98.44")
+sent = an.write_settings({"OVLP": "0", "SPAN": "9"}, hold_resets=False)
+ok("an OVLP written on purpose still lands after the SPAN",
+   sent == ["SPAN 9", "OVLP 0"], str(sent))
+
+# With the settle and the transfer in, which is what a run actually costs. The
+# bare averaging ratio is 80x; the settle and transfer do not shrink with it.
+held = S.capture_time(9, navg=400, ovlp=0.0, settle_recs=5.0, transfer_s=1.5)
+reset = S.capture_time(9, navg=400, ovlp=S.default_overlap(9),
+                       settle_recs=5.0, transfer_s=1.5)
+ok("letting it reset is worth about 39x at span 9",
+   38 < held / reset < 41, f"{held / reset:.1f}x, "
+   f"{S.fmt_hms(held)} against {S.fmt_hms(reset)}")
+ok("... which is 80x on the averaging alone",
+   abs(S.capture_time(9, navg=400, ovlp=0.0, transfer_s=0)
+       / S.capture_time(9, navg=400, ovlp=S.default_overlap(9), transfer_s=0)
+       - 400 / S.independent_records(400, S.default_overlap(9))) < 0.1)
+ok("... for 5 independent records instead of 400",
+   abs(S.independent_records(400, S.default_overlap(9)) - 5.0) < 0.1,
+   f"{S.independent_records(400, S.default_overlap(9)):.1f}")
+# At the wide spans the default IS zero, so there is nothing to trade.
+ok("at span 19 the two are the same run",
+   S.capture_time(19, navg=400, ovlp=0.0)
+   == S.capture_time(19, navg=400, ovlp=S.default_overlap(19)))
+
 an = OrderAn(held="0.00")
 sent = an.write_settings({"SPAN": "11", "NAVG": "100"})
 ok("... and a zero it was holding is re-asserted too, not assumed",
@@ -1556,6 +1594,78 @@ ok("... so the panel never asks for more room", len(heights) == 1,
 ok("... and the window still holds it",
    window_h() >= root.winfo_reqheight(),
    f"window {window_h()}, panel wants {root.winfo_reqheight()}")
+root.destroy()
+
+
+print("\n--- the overlap dial in the panel ---")
+
+root, app = build_app()
+ok("holding is the default, so nothing changes without asking",
+   app.span_resets_ovlp.get() is False)
+ok("... and it is remembered between sessions",
+   "span_resets_ovlp" in app.config_vars())
+
+# The sweep and Apply both have to honour it, and Apply is the one that did not
+# go through write_settings at all - it sent the changes in dict order, so a
+# SPAN could land after the OVLP beside it and reinstall the default over it.
+calls = []
+app.an.write_settings = lambda changes, log=None, hold_resets=True: (
+    calls.append((dict(changes), hold_resets)) or [])
+app.save_csv.set(False), app.save_png.set(False), app.save_txt.set(False)
+app.save_npy.set(False), app.combined.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+app._grab_runs([""], [None], [11])
+root.update()
+ok("the sweep writes SPAN through write_settings",
+   calls and calls[0][0] == {"SPAN": 11}, str(calls[:1]))
+ok("... holding the overlap while the box is unticked", calls[0][1] is True)
+
+calls.clear()
+app.span_resets_ovlp.set(True)
+app._grab_runs([""], [None], [11])
+root.update()
+ok("... and letting it go once it is ticked", calls and calls[0][1] is False,
+   str(calls[:1]))
+
+calls.clear()
+app.busy = False
+app._settings_worker({"OVLP": "0", "SPAN": "11"})
+root.update()
+ok("Apply goes through write_settings too, which it used not to",
+   calls and calls[0][0] == {"OVLP": "0", "SPAN": "11"}, str(calls[:1]))
+ok("... carrying the same setting", calls[0][1] is False)
+root.destroy()
+
+# The estimate has to price the run that will actually happen. Held at OVLP 0 a
+# span 9 trace is 27m40s; reset it is 42 s, and an estimate built on the held
+# value would be out by the whole factor the setting exists to buy.
+root, app = build_app(snap=dict(GOOD, NAVG="400", OVLP="0"))
+app.span_resets_ovlp.set(False)
+slow = app.sweep_plan([""], [None], [9])
+app.span_resets_ovlp.set(True)
+fast = app.sweep_plan([""], [None], [9])
+ok("the estimate follows the dial", slow[0] > 10 * fast[0],
+   f"{S.fmt_hms(slow[0])} held against {S.fmt_hms(fast[0])} reset")
+# 14x rather than the 39x the two runs really differ by, because the held run
+# wants 27m40s and the measurement timeout stops it at 600 s. That is the
+# estimate being honest about what wait_done will do, and it is also a warning:
+# holding the overlap at a narrow span can put the run past the timeout.
+ok("... and the held one is capped by the measurement timeout",
+   abs(slow[0] - (600.0 + 5 * S.record_time(9) + S.TRANSFER_BINARY_S)) < 1e-9,
+   f"{S.fmt_hms(slow[0])}, uncapped it would be "
+   f"{S.fmt_hms(S.capture_time(9, navg=400, ovlp=0.0, settle_recs=5.0, transfer_s=S.TRANSFER_BINARY_S))}")
+ok("... at the span's own default, not the held value",
+   abs(fast[0] - S.capture_time(9, navg=400, ovlp=S.default_overlap(9),
+                                settle_recs=5.0, timeout_s=600.0,
+                                transfer_s=S.TRANSFER_BINARY_S)) < 1e-9,
+   f"{fast[0]:.3f} s")
+# A sweep that does not write SPAN cannot have its overlap reset by one.
+flat = app.sweep_plan([""], [None], [None])
+ok("a sweep that never writes SPAN is priced at the held overlap",
+   abs(flat[0] - S.capture_time(11, navg=400, ovlp=0.0, settle_recs=0.0,
+                                timeout_s=600.0,
+                                transfer_s=S.TRANSFER_BINARY_S)) < 1e-9,
+   f"{flat[0]:.3f} s")
 root.destroy()
 
 

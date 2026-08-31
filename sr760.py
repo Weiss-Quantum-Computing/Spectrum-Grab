@@ -1519,7 +1519,7 @@ class SR760:
         self.last_raw[key] = raw
         return raw
 
-    def write_settings(self, changes, log=None):
+    def write_settings(self, changes, log=None, hold_resets=True):
         """Write {key: code}, each in the spelling that key answers to.
 
         SPAN goes first and everything in SPAN_RESETS goes last, because a
@@ -1527,12 +1527,21 @@ class SR760:
         {"OVLP": "0", "SPAN": "11"} in that order used to leave 98.44 % behind,
         and NAVG then counted records that were 98 % the same samples - an
         error bar eight times better than the data earned, with nothing on
-        screen to say so.
+        screen to say so. That ordering is not optional and applies either way.
 
-        Where SPAN moves and OVLP is not alongside it, the value the analyzer
-        is already holding is read first and put back after, so a span sweep
-        cannot quietly change what the averaging is worth. A value that cannot
-        be read back is not guessed at: the re-assert is skipped and said so.
+        `hold_resets` decides only what happens where SPAN moves and OVLP is
+        NOT alongside it. Holding reads the value the analyzer has and puts it
+        back, so a span sweep cannot change what the averaging is worth. Letting
+        it go leaves the span's default, which is a real choice and not a bug:
+        at OVLP 0 every record is fresh samples and NAVG records cost NAVG
+        record lengths, while at a span's default they advance 16 ms apiece and
+        the same NAVG costs a fraction of the time for a fraction of the
+        independent records. record_stats counts what actually arrived either
+        way, so the trade is priced rather than hidden - which is what makes it
+        safe to offer.
+
+        A held value that cannot be read back is not guessed at: the re-assert
+        is skipped and said so.
 
         Returns every command sent, re-asserts included. The caller is still
         expected to read back - the analyzer clamps a value it dislikes and
@@ -1545,6 +1554,9 @@ class SR760:
             for key in SPAN_RESETS:
                 if key in wanted:
                     after[key] = wanted.pop(key)
+                    continue
+                if not hold_resets:
+                    say(f"  ({key} left to the span default, as asked)")
                     continue
                 held = self.read_settings(key).get(key)
                 if held is None:

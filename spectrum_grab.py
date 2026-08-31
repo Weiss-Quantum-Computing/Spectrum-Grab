@@ -46,7 +46,8 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    SPACE_OWNERS, SPAN_CHOICES, SPANS, TRACE, TRANSFER_ASCII_S,
                    TRANSFER_BINARY_S, averaging_fault, binary_refusal,
                    binary_valid, canonical_units, capture_time, code_of,
-                   convert_amplitude, fmt_hms, fmt_setting, hold_notes,
+                   convert_amplitude, default_overlap, fmt_hms, fmt_setting,
+                   hold_notes,
                    independent_records,
                    label_of, metadata_text, parse_list, parse_setting,
                    overlap_fault, pretty_units, read_csv, readout_fault,
@@ -576,6 +577,21 @@ class App:
         ttk.Checkbutton(row, text="lock front panel while measuring",
                         variable=self.lock).pack(side="left", padx=10)
 
+        # A SPAN write reinstalls that span's default overlap. Holding the
+        # overlap across it keeps every record fresh samples, and costs NAVG
+        # record lengths a trace; letting it go advances records 16 ms apiece,
+        # which is far quicker for proportionally fewer independent records.
+        # Neither is wrong - record_stats counts what actually arrived - so this
+        # is a speed against statistics dial rather than a correctness one, and
+        # the read-out under Averaging prices whichever way it is set.
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=2)
+        self.span_resets_ovlp = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row, text="let a span change reset the overlap (faster, fewer "
+                      "independent records)",
+            variable=self.span_resets_ovlp).pack(side="left")
+
         row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=2)
         self.do_arng = tk.BooleanVar(value=False)
@@ -1052,6 +1068,7 @@ class App:
             "stitch_overlap": self.stitch_overlap, "save_npy": self.save_npy,
             "combined": self.combined, "pause_cases": self.pause_cases,
             "binary": self.binary, "lock": self.lock, "autorange": self.do_arng,
+            "span_resets_ovlp": self.span_resets_ovlp,
             "autorange_s": self.arng_s, "settle_s": self.settle_s,
             "timeout_s": self.timeout_s, "exp_wait_s": self.exp_wait_s,
             "settle_recs": self.settle_recs, "set_name": self.set_name,
@@ -1876,8 +1893,9 @@ class App:
                             # puts the held OVLP back afterwards, and still
                             # writes through command(), so the qform spelling
                             # above is honoured either way.
-                            self.an.write_settings({"SPAN": span},
-                                                   log=self.log)
+                            self.an.write_settings(
+                                {"SPAN": span}, log=self.log,
+                                hold_resets=not self.span_resets_ovlp.get())
                             self.settle_due.set()
                         if self.abort.is_set():
                             raise KeyboardInterrupt
@@ -1964,9 +1982,18 @@ class App:
         autorange = 0.0
         if self.pinned_range is None and self.do_arng.get():
             autorange = self.float_of(self.arng_s, 15.0, "auto-range time")
+        # Which overlap each span will actually run at. When a span change is
+        # allowed to reset it, the held value is not what the run will use -
+        # every span drops to its own default, which is most of why the sweep
+        # is quicker that way. Pricing it at the held value would put the
+        # estimate out by the same factor the setting exists to buy.
+        resets = (self.span_resets_ovlp.get()
+                  and any(s is not None for s in spans))
+        held = value_of(snap, "OVLP")
         per = [capture_time(
             code,
-            navg=code_of(snap, "NAVG"), ovlp=value_of(snap, "OVLP"),
+            navg=code_of(snap, "NAVG"),
+            ovlp=default_overlap(code) if resets else held,
             averaged=averaged,
             settle_recs=(self.float_of(self.settle_recs, DEFAULT_SETTLE_RECS,
                                        "settle record lengths")
@@ -2701,9 +2728,13 @@ class App:
     def _settings_worker(self, changes):
         try:
             if changes:
-                for key, value in changes.items():
-                    self.an.put(self.command(key, value))
-                    self.log(f"  {self.command(key, value)}")
+                # Through write_settings, which the sweep already used and
+                # this did not: applying a span from the panel sent the
+                # changes in dict order, so a SPAN could land after the OVLP
+                # beside it and reinstall the default over the top.
+                self.an.write_settings(
+                    changes, log=self.log,
+                    hold_resets=not self.span_resets_ovlp.get())
                 if any(k in SETTLE_KEYS for k in changes):
                     # Span, start frequency, range or coupling: the filter chain
                     # has to flush before the next average means anything.

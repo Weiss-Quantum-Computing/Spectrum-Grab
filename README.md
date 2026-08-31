@@ -336,6 +336,31 @@ same count `record_stats` arrives at from the clock afterwards, and the same one
 the sweep's time estimate is built on. At `OVLP 0` it is just `N`, which is one
 more thing the `protocol` preset buys.
 
+### Holding the overlap, or letting it go
+
+A SPAN write reinstalls that span's default overlap, and **let a span change
+reset the overlap** in Acquisition decides what happens next. Unticked (the
+default) the held value is read back and put in again, so a span sweep cannot
+change what the averaging is worth. Ticked, the span's default stands.
+
+That is a speed dial, not a correctness one, because `record_stats` counts what
+actually arrived either way. At NAVG 400:
+
+| span | held at `OVLP 0` | reset to the default | independent records |
+|---|---|---|---|
+| 9  | 27m40s | 42.4s | 400 → 5.0 |
+| 11 | 6m56s  | 14.0s | 400 → 7.2 |
+| 13 | 1m45s  | 9.4s  | 400 → 25.9 |
+| 15 | 27.4s  | 8.3s  | 400 → 100.8 |
+| 17, 19 | — | — | no default overlap, so no difference |
+
+A six-span sweep goes from 37 minutes to 1m25s. The sweep estimate follows the
+setting, pricing each span at the overlap it will really run at, and the
+read-out under Averaging prices whichever way it is set. Two things to watch:
+the narrow spans are where the trade is, and holding the overlap there can push
+a run past the **measurement timeout** — NAVG 400 at span 9 wants 27m40s
+against a 600 s default, so it would be cut short and read early.
+
 It matters because **SPAN reinstalls its own default overlap**, up to 98.4375%
 at the narrow end, so NAVG can be honoured to the letter while the trace is
 worth a fifty-fifth of it. 1.5x is the threshold the metadata file uses too. The
