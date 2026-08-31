@@ -47,6 +47,7 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    TRANSFER_BINARY_S, averaging_fault, binary_refusal,
                    binary_valid, canonical_units, capture_time, code_of,
                    convert_amplitude, fmt_hms, fmt_setting, hold_notes,
+                   independent_records,
                    label_of, metadata_text, parse_list, parse_setting,
                    pretty_units, read_csv, readout_fault, reads_in_db,
                    record_stats, record_time, safe_name, span_hz, stats_notes,
@@ -123,6 +124,7 @@ DEFAULT_YMIN, DEFAULT_YMAX = -160.0, -20.0
 # wider every time a grab finished, then back again on the next peek.
 CAPTION_CHARS = 58            # under the preview
 STATUS_CHARS = 64             # the connection, hold and compare lines
+AVG_BOX_W = 420               # the what-the-averaging-is-worth read-out
 
 
 def elide(text, width):
@@ -712,6 +714,21 @@ class App:
                 ttk.Label(grid, text=s.label + ":").grid(
                     row=row, column=col * 2, sticky="e", padx=(0, 4), pady=1)
                 self.setting_widget(grid, s, row, col * 2 + 1)
+            if group == "Averaging":
+                # What the two boxes above are actually worth. NAVG counts
+                # records the analyzer averaged, not independent ones, and SPAN
+                # reinstalls its own default overlap - 98.44% at the narrow end
+                # - so NAVG can be honoured to the letter while the trace is
+                # worth a fifty-fifth of it. Nothing to fill in: it reads the
+                # boxes as they are typed, before Apply, so a setting can be
+                # priced before it is sent.
+                box = tk.Frame(frame, width=AVG_BOX_W, height=32)
+                box.pack(fill="x", padx=8, pady=(0, 6))
+                box.pack_propagate(False)
+                self.avg_worth = ttk.Label(box, text="", anchor="w",
+                                           justify="left",
+                                           wraplength=AVG_BOX_W - 8)
+                self.avg_worth.pack(fill="both", expand=True)
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=8, pady=(2, 6))
@@ -2312,26 +2329,59 @@ class App:
             d, n, planned))
         return True
 
-    def write_sweep_csv(self, base, records, cases, ylabel):
-        """The sweep's traces as one CSV per case, sorted into one curve.
+    @staticmethod
+    def sweep_groups(records, cases):
+        """The sweep's segments split into the sets that belong in one file:
+        one per (case, span), in the order the loop walked them.
 
-        A case is a different measurement, so it gets its own file; within one,
-        the segments are what a stitch is made of and belong on one axis. The
-        third column says which segment each point came from, so nothing is
+        Start frequencies tile a band, so they join into one curve - that is
+        what a stitch is. A case and a span do not. A case is whatever you
+        changed by hand between runs, so those are separate measurements by
+        construction. A span changes the bin width, and with it the resolution
+        and the noise bandwidth of every point: two spans over one band are two
+        measurements of it, not two pieces of one, and sorting them into a
+        single frequency column interleaves rows of different resolutions into
+        something no reader can take apart again.
+
+        The span only enters the file name when the sweep used more than one,
+        so a stitch at a single span keeps the name it has always had.
+        """
+        many_spans = len({r["span"] for r in records}) > 1
+        groups, order = {}, []
+        for case in cases:
+            for r in records:
+                if r["case"] != case:
+                    continue
+                key = (case, r["span"])
+                if key not in groups:
+                    parts = ([safe_name(case)] if case else [])
+                    if many_spans:
+                        parts.append("span"
+                                     + ("?" if r["span"] is None
+                                        else str(r["span"])))
+                    groups[key] = {"case": case, "span": r["span"], "rows": [],
+                                   "suffix": ("_" + "_".join(parts)
+                                              if parts else "")}
+                    order.append(key)
+                groups[key]["rows"].append(r)
+        return [groups[k] for k in order]
+
+    def write_sweep_csv(self, base, records, cases, ylabel):
+        """The sweep's traces, one CSV per (case, span), sorted into one curve.
+
+        The third column says which segment each point came from, so nothing is
         lost by joining them - the overlaps stay separable, and a two-column
         reader that ignores it still sees the stitch.
         """
         written = []
-        for case in cases:
-            rows = [r for r in records if r["case"] == case]
-            if not rows:
-                continue
+        for group in self.sweep_groups(records, cases):
+            rows = group["rows"]
             freqs = np.concatenate([r["freqs"] for r in rows])
             amps = np.concatenate([r["amps"] for r in rows])
             seg = np.concatenate([np.full(len(r["freqs"]), i, dtype=float)
                                   for i, r in enumerate(rows, 1)])
             order = np.argsort(freqs, kind="stable")
-            path = base + (f"_{safe_name(case)}.csv" if case else ".csv")
+            path = base + group["suffix"] + ".csv"
             np.savetxt(path, np.column_stack([freqs[order], amps[order],
                                               seg[order]]),
                        delimiter=",", comments="",
@@ -2339,8 +2389,8 @@ class App:
             written.append((path, len(rows)))
         return written
 
-    def sweep_metadata_text(self, records, cases, starts, spans, planned,
-                            ended, ylabel):
+    def sweep_metadata_text(self, base, records, cases, starts, spans,
+                            planned, ended, ylabel):
         """The whole sweep described once.
 
         Everything the per-segment files used to carry, minus the repetition.
@@ -2366,20 +2416,24 @@ class App:
                                       f"not all on one scale")
         head = metadata_text(self.an, records[-1]["snap"], extra, self.command)
 
-        table = ["", "segments  (the settings above are as read after the last "
-                     "one)",
-                 f"  {'#':>4}  {'case':<12} {'span':>4} {'start (Hz)':>12} "
-                 f"{'top (Hz)':>12} {'meas (s)':>9} {'N_indep':>8} "
-                 f"{'1 sigma':>8}  {'overload':<10} quality"]
-        suspect = []
-        for case in cases:
-            for i, r in enumerate([x for x in records if x["case"] == case], 1):
+        # Grouped exactly as the CSVs are, and numbered the same way, so a row
+        # here and a segment number there are the same segment.
+        table, suspect = [], []
+        for group in self.sweep_groups(records, cases):
+            table += ["", f"segments of {os.path.basename(base)}"
+                          f"{group['suffix']}.csv"
+                          + (f"   (case '{group['case']}')"
+                             if group["case"] else "")
+                          + (f"   (span {group['span']})"
+                             if group["span"] is not None else ""),
+                      f"  {'#':>4} {'start (Hz)':>12} {'top (Hz)':>12} "
+                      f"{'meas (s)':>9} {'N_indep':>8} {'1 sigma':>8}  "
+                      f"{'overload':<10} quality"]
+            for i, r in enumerate(group["rows"], 1):
                 n = r["notes"]
                 quality = n.get("trace quality", "")
                 table.append(
-                    f"  {i:>4}  {(case or '-'):<12} "
-                    f"{('?' if r['span'] is None else r['span']):>4} "
-                    f"{float(r['freqs'][0]):>12.6g} "
+                    f"  {i:>4} {float(r['freqs'][0]):>12.6g} "
                     f"{float(r['freqs'][-1]):>12.6g} "
                     f"{n.get('measure time (s)', '?'):>9} "
                     f"{n.get('independent records', '?'):>8} "
@@ -2387,7 +2441,10 @@ class App:
                     f"{n.get('overload', '?'):<10} "
                     f"{'SUSPECT' if quality.startswith('SUSPECT') else 'clean'}")
                 if quality.startswith("SUSPECT"):
-                    suspect.append(f"  {(case or '-')} #{i}: {quality}")
+                    suspect.append(f"  {group['suffix'] or 'sweep'} #{i}: "
+                                   f"{quality}")
+        table.insert(0, "")
+        table.insert(1, "the settings above are as read after the last segment")
         if suspect:
             table += ["", "suspect segments"] + suspect
         return head + "\n".join(table) + "\n"
@@ -2408,7 +2465,8 @@ class App:
         # even when only some of them are ticked - the same rule save_run had
         # to be taught, for the same reason.
         suffixes = ["_freqs.npy", "_amps.npy", "_axes.json", ".png", ".txt"]
-        suffixes += [f"_{safe_name(c)}.csv" if c else ".csv" for c in cases]
+        suffixes += [g["suffix"] + ".csv"
+                     for g in self.sweep_groups(records, cases)] or [".csv"]
         base = unique_base(outdir, f"{self.safe_title()}_sweep_{stamp}",
                            suffixes)
         if records and self.save_csv.get():
@@ -2416,8 +2474,9 @@ class App:
                 self.log(f"  {os.path.basename(path)}  ({n} segments)")
         if records and self.save_txt.get():
             with open(base + ".txt", "w", encoding="utf-8") as fh:
-                fh.write(self.sweep_metadata_text(records, cases, starts, spans,
-                                                  planned, ended, ylabel))
+                fh.write(self.sweep_metadata_text(base, records, cases,
+                                                  starts, spans, planned,
+                                                  ended, ylabel))
             self.log(f"  {os.path.basename(base)}.txt")
         if self.save_npy.get():
             np.save(base + "_freqs.npy", freqs_m)
@@ -2460,7 +2519,59 @@ class App:
         """True if the panel value differs from what the analyzer last said."""
         return self.set_vars[key].get().strip() != self.set_inst[key]
 
+    def averaging_worth(self):
+        """What the Averaging boxes are worth, as (text, ok).
+
+        Read off the panel rather than the analyzer, so it answers for what is
+        typed and not yet applied - which is the moment the question is being
+        asked. NAVG counts records the analyzer averaged, not independent ones,
+        and SPAN reinstalls its own default overlap, so this is the difference
+        between what was asked for and what the trace is worth.
+        """
+        def shown(key):
+            return self.set_vars[key].get().strip() if key in self.set_vars \
+                else ""
+
+        def number(key):
+            try:
+                return float(shown(key))
+            except ValueError:
+                return float("nan")
+
+        if shown("AVGO") != "On":
+            return ("averaging off - the trace is one record, 1 sigma 100%",
+                    False)
+        kind = shown("AVGT")
+        if kind and kind != "RMS":
+            return (f"{kind.lower()} - only RMS averaging measures noise",
+                    False)
+        if shown("AVGM") == "Exponential":
+            return ("exponential - a running average of no definite depth, "
+                    "so there is no count to state", False)
+        navg, ovlp = number("NAVG"), number("OVLP")
+        n = independent_records(navg, ovlp)
+        if not np.isfinite(n):
+            return ("(set the number of averages to see what it is worth)",
+                    True)
+        rel = 1.0 / np.sqrt(n)
+        line = (f"{navg:g} averages at {ovlp:g}% overlap = {n:.1f} independent "
+                f"records, 1 sigma {rel:.3g} ({10 * np.log10(1 + rel):.2f} dB)")
+        # 1.5 is the same threshold stats_notes calls out in the metadata.
+        if navg / n > 1.5:
+            return (line + f"\nNAVG overstates the statistics {navg / n:.0f}x "
+                           f"- SPAN sets this overlap unless it is re-asserted",
+                    False)
+        return line, True
+
+    def refresh_averaging(self):
+        """Main thread. Keep the read-out under Averaging telling the truth."""
+        text, ok = self.averaging_worth()
+        self.avg_worth.configure(text=text, foreground="#060" if ok else "#c60")
+
     def refresh_marks(self):
+        # Every settings box already reports its own keystrokes here, so the
+        # averaging read-out rides along rather than tracing the vars twice.
+        self.refresh_averaging()
         pending = 0
         for key, mark in self.set_marks.items():
             if self.edited(key):

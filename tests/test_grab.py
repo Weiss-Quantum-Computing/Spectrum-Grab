@@ -96,6 +96,15 @@ class FakeAn:
 
     def put(self, cmd):
         self.sent.append(cmd)
+        # Track what the write does to the analyzer, so a snapshot taken after
+        # it reports the span and start frequency the sweep just set. Those
+        # decide which file a segment is written to and how wide its trace is,
+        # and a fake that ignored them made a multi-span sweep look like a
+        # single-span one. The indexed spelling puts the graph number first, so
+        # the value is what follows the comma.
+        head, _, value = cmd.partition(" ")
+        if head in ("SPAN", "STRF") and value:
+            self.snap[head] = value.split(",")[-1].strip()
 
     def get(self, query):
         return "0"
@@ -152,12 +161,21 @@ class FakeAn:
             self.refresh_status()
         return self._status
 
+    def band(self, n_bins):
+        """The frequencies the analyzer would return for the span and start it
+        is currently on, so a sweep that moves either gets traces that moved
+        with it. The default snapshot is span 11 from 0 Hz, which is the
+        0 to 390 Hz this used to return unconditionally."""
+        start = float(self.snap.get("STRF", 0) or 0)
+        width = S.span_hz(S.code_of(self.snap, "SPAN", 11))
+        return np.linspace(start, start + width, n_bins)
+
     def trace_binary(self, trace, n_bins, in_db=True):
-        return (np.linspace(0.0, 390.0, n_bins),
+        return (self.band(n_bins),
                 np.full(n_bins, -120.0 if in_db else 1e-6))
 
     def trace_ascii(self, trace, n_bins, progress=None):
-        return np.linspace(0.0, 390.0, n_bins), np.full(n_bins, 1e-6)
+        return self.band(n_bins), np.full(n_bins, 1e-6)
 
     def read_settings(self, *keys):
         return {k: self.snap[k] for k in keys if k in self.snap}
@@ -1471,6 +1489,172 @@ app.refresh_hold()
 ok("an armed hold with a long set name leaves the width alone",
    width() == rest, f"{width()} vs {rest}")
 root.destroy()
+
+# --------------------------------- 13. what the averaging is actually worth
+
+print("\n--- independent_records ---")
+
+ok("no overlap means NAVG is the count",
+   S.independent_records(100, 0) == 100.0)
+ok("one average is one record", S.independent_records(1, 0) == 1.0)
+# N records stepping by (1 - overlap) span 1 + (N-1)(1-overlap) record lengths.
+ok("half overlap halves what the extra records buy",
+   S.independent_records(101, 50) == 51.0,
+   str(S.independent_records(101, 50)))
+# The two the 31 Aug measurement of SPAN's default overlap turned into a number,
+# against the exact overlaps the analyzer installs.
+ok("NAVG 400 at 93.75% overlap is worth 25.94",
+   abs(S.independent_records(400, 93.75) - 25.9375) < 1e-9,
+   f"{S.independent_records(400, 93.75):.4f}")
+ok("NAVG 400 at 98.4375% overlap is worth 7.23",
+   abs(S.independent_records(400, 98.4375) - 7.234375) < 1e-9,
+   f"{S.independent_records(400, 98.4375):.4f}")
+# default_overlap works from the span TABLE, whose values are the manual's
+# rounded ones - 1.56 kHz for a span that is really 1562.5 - so it predicts
+# 93.76 where the analyzer installs 93.75. Close enough to warn on, and
+# write_settings re-asserts the held value by reading it back rather than
+# trusting this.
+ok("the prediction lands within a rounding of the real default",
+   abs(S.default_overlap(13) - 93.75) < 0.02
+   and abs(S.default_overlap(11) - 98.4375) < 0.02,
+   f"span 13 {S.default_overlap(13):.4f}, span 11 {S.default_overlap(11):.4f}")
+ok("... so what it says NAVG 400 is worth is right to a tenth of a record",
+   abs(S.independent_records(400, S.default_overlap(13)) - 25.94) < 0.1
+   and abs(S.independent_records(400, S.default_overlap(11)) - 7.23) < 0.1,
+   f"{S.independent_records(400, S.default_overlap(13)):.2f} and "
+   f"{S.independent_records(400, S.default_overlap(11)):.2f}")
+ok("and at span 19, where the default is zero, all 400 count",
+   S.independent_records(400, S.default_overlap(19)) == 400.0)
+ok("nothing to count gives NaN, not a guess",
+   not np.isfinite(S.independent_records(0, 0))
+   and not np.isfinite(S.independent_records("", 0)))
+ok("an impossible overlap does not divide by zero",
+   np.isfinite(S.independent_records(100, 100)))
+# capture_time predicts a run from the same count, so the two cannot drift.
+ok("capture_time is this count times the record length",
+   abs(S.capture_time(11, navg=400, ovlp=93.75, transfer_s=0)
+       - S.record_time(11) * S.independent_records(400, 93.75)) < 1e-9)
+
+print("\n--- and what the panel says about it ---")
+
+root, app = build_app()
+root.update()
+rest = root.winfo_reqwidth()
+
+
+def worth(**kw):
+    for k, v in kw.items():
+        app.set_vars[k].set(v)
+    root.update_idletasks()
+    return app.avg_worth.cget("text")
+
+
+text = worth(AVGO="On", AVGT="RMS", AVGM="Linear", NAVG="100", OVLP="0")
+ok("no overlap reads back as all of NAVG", "= 100.0 independent" in text, text)
+ok("... with its error bar", "1 sigma 0.1" in text and "0.41 dB" in text, text)
+ok("... and no warning", "overstates" not in text)
+
+text = worth(NAVG="400", OVLP="98.4375")
+ok("span 11's default overlap is priced", "7.2 independent" in text, text)
+ok("... and called out", "overstates the statistics 55x" in text, text)
+ok("... naming what puts it there", "SPAN sets this overlap" in text)
+
+text = worth(NAVG="300", OVLP="93.75")
+ok("the 26 Aug legacy setting reads 19.7", "19.7 independent" in text, text)
+
+ok("exponential has no count to state",
+   "no definite depth" in worth(AVGM="Exponential"))
+ok("vector is not noise averaging",
+   "only RMS" in worth(AVGM="Linear", AVGT="Vector"))
+ok("averaging off is one record",
+   "one record" in worth(AVGT="RMS", AVGO="Off"))
+ok("an empty box asks rather than guesses",
+   "set the number" in worth(AVGO="On", NAVG=""))
+# It is a label that changes on every keystroke, so it gets the same treatment
+# as the preview caption.
+worth(NAVG="400", OVLP="98.4375")
+ok("the read-out cannot resize the panel", root.winfo_reqwidth() == rest,
+   f"{root.winfo_reqwidth()} vs {rest}")
+root.destroy()
+
+
+# ------------------------- 14. spans and cases get files of their own
+
+print("\n--- a sweep splits by case and span, not by start frequency ---")
+
+
+def sweep_files(cases, starts, spans):
+    out = os.path.join(TMP, "split_" + str(abs(hash((tuple(cases),
+                                                     tuple(starts),
+                                                     tuple(spans))))))
+    os.makedirs(out, exist_ok=True)
+    root, app = build_app(outdir=out)
+    app.save_png.set(False), app.save_npy.set(False), app.combined.set(False)
+    app.lock.set(False), app.pause_cases.set(False)
+    if cases != [""]:
+        app.cases_txt.set(", ".join(cases))
+    app._grab_runs(cases, starts, spans)
+    root.update()
+    root.destroy()
+    return sorted(n for n in os.listdir(out) if n.endswith(".csv")), out
+
+
+# Start frequencies tile a band, so they join. That is what a stitch is.
+files, out = sweep_files([""], [0.0, 390.0, 780.0], [11])
+ok("start frequencies join into one file", len(files) == 1, str(files))
+rows = np.loadtxt(os.path.join(out, files[0]), delimiter=",", skiprows=1)
+ok("... holding every segment", len(set(rows[:, 2])) == 3, str(len(rows)))
+ok("... under the name a single-span sweep has always had",
+   "span" not in files[0], files[0])
+
+# Was: a span change alters the bin width, and with it the resolution and the
+# noise bandwidth of every point - two spans over one band are two measurements
+# of it, not two pieces of one, and sorting them into one frequency column
+# interleaves rows of different resolutions into something unseparable.
+files, out = sweep_files([""], [0.0, 390.0], [11, 15])
+ok("two spans get a file each", len(files) == 2, str(files))
+ok("... named for the span", all("_span" in n for n in files), str(files))
+widths = []
+for n in files:
+    r = np.loadtxt(os.path.join(out, n), delimiter=",", skiprows=1)
+    first = r[r[:, 2] == 1]
+    widths.append(round(first[:, 0].max() - first[:, 0].min()))
+ok("... and each holds one resolution", widths == [390, 6250], str(widths))
+
+files, _ = sweep_files(["dark", "light"], [0.0], [11, 15])
+ok("a case and a span both split", len(files) == 4, str(files))
+ok("... named for both",
+   sorted(files) == sorted([f"sr760_sweep_{TODAY}_dark_span11.csv",
+                            f"sr760_sweep_{TODAY}_dark_span15.csv",
+                            f"sr760_sweep_{TODAY}_light_span11.csv",
+                            f"sr760_sweep_{TODAY}_light_span15.csv"]),
+   str(files))
+
+print("\n--- and the metadata is grouped the same way ---")
+
+out = os.path.join(TMP, "splitmeta")
+os.makedirs(out, exist_ok=True)
+root, app = build_app(outdir=out)
+app.save_png.set(False), app.save_npy.set(False), app.combined.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+app.cases_txt.set("dark, light")
+app._grab_runs(["dark", "light"], [0.0, 390.0], [11, 15])
+root.update()
+root.destroy()
+meta = open(os.path.join(out, f"sr760_sweep_{TODAY}.txt"),
+            encoding="utf-8").read()
+ok("one metadata file still covers the whole sweep",
+   sum(n.endswith(".txt") for n in os.listdir(out)) == 1)
+ok("... with a table per file", meta.count("segments of sr760_sweep_") == 4,
+   str(meta.count("segments of sr760_sweep_")))
+ok("... each naming its own CSV",
+   "segments of sr760_sweep_" + TODAY + "_dark_span11.csv" in meta)
+ok("... and its case and span", "(case 'dark')" in meta
+   and "(span 15)" in meta)
+ok("... numbered from one within each, to match the segment column",
+   meta.count("\n     1 ") == 4 and meta.count("\n     2 ") == 4,
+   f"{meta.count(chr(10) + '     1 ')} firsts, "
+   f"{meta.count(chr(10) + '     2 ')} seconds")
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

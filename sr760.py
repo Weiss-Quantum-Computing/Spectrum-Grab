@@ -59,6 +59,7 @@ __all__ = [
     "code_of", "label_of", "trace_units", "pretty_units", "reads_in_db",
     "trace_yscale", "binary_valid", "binary_refusal", "span_hz", "record_time",
     "SPAN_RESETS", "OVLP_ADVANCE_S", "default_overlap",
+    "independent_records",
     "record_stats", "stats_notes", "averaging_fault", "readout_fault",
     "hold_notes", "safe_name", "unique_base", "write_csv", "metadata_text",
     "TRANSFER_BINARY_S", "TRANSFER_ASCII_S", "fmt_hms", "capture_time",
@@ -793,6 +794,36 @@ TRANSFER_BINARY_S = 1.5
 TRANSFER_ASCII_S = 25.0
 
 
+def independent_records(navg, ovlp=0.0):
+    """What NAVG averages at OVLP% overlap are actually worth, in records.
+
+    Records that share samples share information. Each new record advances by
+    (1 - overlap) of a record length, so N of them span
+
+        1 + (N - 1)(1 - overlap)
+
+    record lengths, and that - not N - is what the error bar rests on. At no
+    overlap it is N, which is the whole reason the protocol preset sets OVLP 0.
+
+    This is the same count record_stats arrives at from the clock, elapsed
+    divided by T_rec, and capture_time multiplies back up to predict a run. Here
+    it is worked out from the two numbers on the front panel instead, so the
+    panel can say what a setting is worth before the run rather than after.
+
+    It matters because SPAN reinstalls its own default overlap - 98.44 % at the
+    narrow end - so NAVG can be honoured to the letter while the trace is worth
+    a fraction of it. See default_overlap.
+    """
+    try:
+        n = float(navg)
+        share = min(max(float(ovlp or 0.0) / 100.0, 0.0), 0.99)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(n) or n < 1:
+        return float("nan")
+    return 1.0 + (n - 1.0) * (1.0 - share)
+
+
 def fmt_hms(seconds):
     """Seconds as the shortest honest thing to read.
 
@@ -844,8 +875,9 @@ def capture_time(span_code, navg=None, ovlp=None, averaged=True,
     if not np.isfinite(t_rec):
         return float("nan")
     if averaged and navg:
-        share = min(max(float(ovlp or 0.0) / 100.0, 0.0), 0.99)
-        measure = t_rec + (float(navg) - 1.0) * t_rec * (1.0 - share)
+        # One model, shared with the panel's own read-out: a run lasts as many
+        # record lengths as the averaging is worth in independent records.
+        measure = t_rec * independent_records(navg, ovlp)
     else:
         measure = float(exp_wait_s or 0.0)
     if timeout_s:

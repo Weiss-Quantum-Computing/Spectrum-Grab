@@ -291,6 +291,32 @@ display and marker settings. It reads on connect, on **Read**, and automatically
 after every measurement, so settings changed with the front panel show up
 without asking.
 
+### What the averaging is worth
+
+Under the Averaging block is a line with nothing to fill in. It reads the
+**Number** and **Overlap (%)** boxes as you type them — before Apply — and says
+what they buy:
+
+```
+100 averages at 0% overlap = 100.0 independent records, 1 sigma 0.1 (0.41 dB)
+
+400 averages at 98.4375% overlap = 7.2 independent records, 1 sigma 0.372 (1.37 dB)
+NAVG overstates the statistics 55x - SPAN sets this overlap unless it is re-asserted
+```
+
+NAVG counts records the analyzer averaged, not independent ones. Records that
+overlap share samples, so `N` of them are worth `1 + (N-1)(1 - overlap)` — the
+same count `record_stats` arrives at from the clock afterwards, and the same one
+the sweep's time estimate is built on. At `OVLP 0` it is just `N`, which is one
+more thing the `protocol` preset buys.
+
+It matters because **SPAN reinstalls its own default overlap**, up to 98.44% at
+the narrow end, so NAVG can be honoured to the letter while the trace is worth a
+fifty-fifth of it. The box turns amber when NAVG overstates by more than 1.5x,
+which is the threshold the metadata file uses too. It also names the cases where
+there is no count to state at all: averaging off, exponential mode, and vector
+or peak-hold averaging.
+
 To change something, edit the field and press **Apply changes**:
 
 - Only edited fields are written. A `*` next to a field marks it as edited but
@@ -327,11 +353,16 @@ so an empty Sweep panel is a single grab at the current settings.
 - **Span codes** - e.g. `9, 11, 15`. Codes are 0-19; the panel's Span dropdown
   shows which frequency each one is.
 - **Start freqs (Hz)** - e.g. `0, 300, 600`, or `0:1000:47` for start:stop:step.
-- **Cases** - free-text labels, e.g. `in lock, out of lock, no light`. Each one
-  goes into the file names, and with **pause before each case** ticked the sweep
-  stops and waits for you before starting it - the scripts'
-  `input("Press Enter to continue")`, for setting something up by hand between
-  runs.
+- **Cases** - free-text labels, e.g. `in lock, out of lock, no light`. **A case
+  sets nothing on the analyzer.** It is a label for something *you* change by
+  hand between runs — a shutter, a cable, a resistor, the lock — so it can be
+  anything at all, and the panel neither knows nor checks what it was. What it
+  does is go into the file names and the plot titles, become an axis of the
+  `.npy` matrices, and — with **pause before each case** ticked — stop the sweep
+  with a "set up case 'X', then continue" prompt before each one, which is the
+  scripts' `input("Press Enter to continue")`. Anything the analyzer itself can
+  set belongs in the settings panel or in the span and start-frequency lists
+  instead.
 
 The three nest: every case runs every start frequency at every span, and
 **RUN SWEEP** is what starts it.
@@ -363,8 +394,22 @@ in the combined output too.
 
 The combined CSV carries a third column saying which segment each point came
 from, so joining them loses nothing: the overlaps stay separable, and a
-two-column reader that ignores it still sees the stitch. A sweep with several
-**cases** gets one CSV per case, since those are different measurements.
+two-column reader that ignores it still sees the stitch.
+
+**What joins and what does not.** Start frequencies tile a band, so they join
+into one curve — that is what a stitch *is*. A case and a span do not:
+
+| varies | one file or many | why |
+|---|---|---|
+| start frequency | **one** | segments of one band at one resolution |
+| span | **one per span** | a different bin width, so a different resolution and noise bandwidth — two spans over one band are two measurements of it, not two pieces of one |
+| case | **one per case** | whatever you changed by hand; separate measurements by construction |
+
+So `<title>_sweep_<date>.csv` for a stitch, and
+`<title>_sweep_<date>_dark_span11.csv` when a sweep varies both. The span only
+enters the name when the sweep actually used more than one, so a single-span
+stitch keeps the name it has always had. The `.txt` stays one file for the whole
+sweep, with a table per CSV, numbered to match its `segment` column.
 
 The combined `.txt` is what the per-segment ones used to be, minus the
 repetition. The settings block is written once — a sweep holds the analyzer
