@@ -1,0 +1,1234 @@
+"""
+Control for the Stanford Research SR760 FFT spectrum analyser over GPIB.
+
+    from sr760 import SR760
+
+    with SR760() as an:                       # auto-finds the SR760 on GPIB
+        print(an.idn)
+        an.apply(PRESETS["protocol"])
+        an.pin_range(-30)
+        an.start()
+        an.wait_done(600)
+        an.refresh_status()                   # one read; the flags are cached
+        f, a = an.trace(TRACE, N_BINS)
+
+This is the project's only instrument layer: spectrum_grab.py imports it rather
+than carrying its own copy, so a fix to the command spelling, the settings
+model, the status handling or the file format lands in the panel and in scripts
+at once. It has to sit beside the panel for the panel to run.
+
+Nothing here imports tkinter, matplotlib or pillow, and nothing here draws: a
+headless protocol runner imports this module on the bare system interpreter,
+where numpy and pyvisa are all that exist.
+
+Two things about this instrument that the code encodes and that are easy to
+"fix" back into bugs:
+
+* An SR760 command either takes the graph number as its first parameter or it
+  does not, and that decides both how it is queried and how it is written.
+  WNDO answers "WNDO? 0" and needs "WNDO 0,2"; a bare "WNDO 2" is read as a
+  graph number and silently changes nothing. FMTS and MRLK go the other way -
+  they are global underneath and take a single parameter, so "FMTS 0,1" sets
+  nothing but the leading 0. Getting it wrong is silent in one direction and a
+  timeout in the other, which is why `spellings` carries both and the class
+  learns which one this analyser answers.
+* Reading a status byte clears it. See `refresh_status`.
+
+Requires: pyvisa + a VISA runtime with GPIB (NI-488.2 on this machine), numpy.
+"""
+
+from __future__ import annotations
+
+import datetime
+import time
+from collections import namedtuple
+
+import numpy as np
+import pyvisa
+
+__all__ = [
+    "SR760", "Analyzer", "Status", "PRESETS", "SCRIPT_DEFAULTS",
+    "DEFAULT_ADDRESS", "TRACE", "N_BINS", "CONNECT_TIMEOUT_MS",
+    "OP_TIMEOUT_MS", "SETTINGS_TIMEOUT_MS", "READY_PROBE", "READY_POLL_MS",
+    "READY_TIMEOUT_S", "DEFAULT_EXP_WAIT_S", "DEFAULT_SETTLE_RECS",
+    "SETTLE_KEYS", "SPACE_OWNERS", "BAD_NAME_CHARS", "SPANS", "SPAN_CHOICES",
+    "Setting", "spellings", "num", "enum", "SETTING_GROUPS", "ALL_SETTINGS",
+    "BY_KEY", "fmt_setting", "parse_setting", "parse_list", "code_of",
+    "label_of", "trace_units", "pretty_units", "reads_in_db", "trace_yscale",
+    "binary_valid", "span_hz", "record_time", "record_stats", "stats_notes",
+    "averaging_fault", "hold_notes", "safe_name", "unique_base", "write_csv",
+    "metadata_text",
+]
+
+DEFAULT_ADDRESS = "GPIB0::10::INSTR"
+TRACE = 0                     # 0 = the active trace
+N_BINS = 400                  # the SR760's x-axis resolution, fixed for FFT displays
+CONNECT_TIMEOUT_MS = 5000
+OP_TIMEOUT_MS = 20000
+SETTINGS_TIMEOUT_MS = 2000    # a query the analyzer dislikes costs a whole timeout
+
+# Auto offset takes the analyzer off the bus for several seconds: it accepts the
+# command and then stops answering until the DC offset has settled, so anything
+# asked in that window comes back VI_ERROR_TMO. Waiting it out means asking
+# something harmless over and over with a short timeout - the full operation
+# timeout would cost 20 s per miss - until an answer comes back. SPAN? is the
+# probe because it is the first query the settings panel makes, so an analyzer
+# that answers it is ready for the rest.
+READY_PROBE = "SPAN?"
+READY_POLL_MS = 1500
+READY_TIMEOUT_S = 45.0
+
+# How long to let an average run when it has no finish of its own - exponential
+# averaging, or averaging switched off. The measurement timeout is the wrong
+# knob for this: it is meant as the limit on a wait that normally ends by
+# itself, so reusing it means every such capture takes the whole ten minutes.
+DEFAULT_EXP_WAIT_S = 30.0
+
+# Settling after a change of span, start frequency, range or coupling, counted
+# in record lengths because that is the unit the analyzer's own settling is in:
+# the decimation filter chain has to flush, and how long that takes scales with
+# the record, not with the wall clock. wait_ready() is a different thing - it
+# waits for the analyzer to answer a query again, which it will do while its
+# filters are still full of the previous span's data.
+DEFAULT_SETTLE_RECS = 5.0
+
+# Writing any of these means the next average has to settle first.
+SETTLE_KEYS = ("SPAN", "STRF", "CTRF", "IRNG", "ARNG", "ICPL")
+
+# Widgets that already use Space themselves. Space is only the GRAB shortcut
+# when the focus is not sitting on one of these - otherwise typing a space in
+# the title box (or toggling a focused checkbox) would fire an acquisition.
+SPACE_OWNERS = {
+    "Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox",
+    "Checkbutton", "TCheckbutton", "Radiobutton", "TRadiobutton",
+    "Button", "TButton",
+}
+
+BAD_NAME_CHARS = r'<>:"/\|?*'
+
+# Span is set by code, not by frequency, so this table is the only way back to
+# Hz - which the file names, the stitch helper and the metadata all need.
+SPANS = [
+    ("191 mHz", 0.191), ("382 mHz", 0.382), ("763 mHz", 0.763), ("1.5 Hz", 1.5),
+    ("3.1 Hz", 3.1), ("6.1 Hz", 6.1), ("12.2 Hz", 12.2), ("24.4 Hz", 24.4),
+    ("48.75 Hz", 48.75), ("97.5 Hz", 97.5), ("195 Hz", 195.0), ("390 Hz", 390.0),
+    ("780 Hz", 780.0), ("1.56 kHz", 1560.0), ("3.125 kHz", 3125.0),
+    ("6.25 kHz", 6250.0), ("12.5 kHz", 12500.0), ("25 kHz", 25000.0),
+    ("50 kHz", 50000.0), ("100 kHz", 100000.0),
+]
+SPAN_CHOICES = tuple(f"{i} - {label}" for i, (label, _) in enumerate(SPANS))
+
+# Settings the panel shows and can push back. `key` doubles as the dict key
+# everywhere.
+#   num  - free-form number
+#   enum - the analyzer answers with an integer; `choices` maps code -> label
+#
+# An SR760 command either takes the graph number as its first parameter or it
+# does not, and that one fact decides how it is both queried and written. Which
+# way round a command goes cannot be guessed reliably - WNDO is written
+# "WNDO 0,2" but the manual's own summary reads "WNDO i", while FMTS and MRLK go
+# the other way - and getting it wrong is silent: the analyzer accepts
+# "WNDO 2" as a graph number and changes nothing.
+#
+# So `queries` holds both spellings, likeliest first, and the app asks with each
+# until one answers. `writes` holds the matching write for each, so whichever
+# query turned out to be right also fixes the shape of the write. A command that
+# answers neither query ends up write-only, using the first spelling.
+Setting = namedtuple("Setting", "label key queries writes kind choices")
+
+
+def spellings(root, trace, first_indexed):
+    """The (query, write) pair for each way the command could be spelled,
+    likeliest first."""
+    t = 0 if trace is None else trace
+    indexed = (f"{root}? {t}", f"{root} {t},{{v}}")
+    plain = (root + "?", root + " {v}")
+    pair = (indexed, plain) if first_indexed else (plain, indexed)
+    return tuple(p[0] for p in pair), tuple(p[1] for p in pair)
+
+
+def num(label, key, root, first_indexed=False):
+    queries, writes = spellings(root, None, first_indexed)
+    return Setting(label, key, queries, writes, "num", None)
+
+
+def enum(label, key, root, choices, trace=None, first_indexed=None):
+    if first_indexed is None:
+        first_indexed = trace is not None
+    queries, writes = spellings(root, trace, first_indexed)
+    return Setting(label, key, queries, writes, "enum", choices)
+
+
+SETTING_GROUPS = [
+    ("Frequency", [
+        enum("Span", "SPAN", "SPAN", SPAN_CHOICES),
+        num("Start freq (Hz)", "STRF", "STRF"),
+        num("Center freq (Hz)", "CTRF", "CTRF"),
+        # The window trades frequency resolution against spectral leakage:
+        # uniform resolves best, flattop is most accurate on sine amplitude,
+        # Hanning is the one to use on a noise floor, BMH separates close peaks.
+        # WNDO is graph-indexed both ways: it answers "WNDO? 0" and needs
+        # "WNDO 0,i". A bare "WNDO i" is taken as a graph number and does
+        # nothing, which is what the bench scripts were sending.
+        enum("Window", "WNDO", "WNDO",
+             ("Uniform", "Flattop", "Hanning", "BMH"), first_indexed=True),
+    ]),
+    ("Measurement (trace 0)", [
+        enum("Measurement", "MEAS0", "MEAS",
+             ("Spectrum", "PSD", "Time record", "Octave"), TRACE),
+        enum("Display", "DISP0", "DISP",
+             ("LogMag", "LinMag", "Real", "Imag", "Phase"), TRACE),
+        enum("Units", "UNIT0", "UNIT",
+             ("Vpk / deg", "Vrms / rad", "dBV", "dBVrms"), TRACE),
+        enum("Volts / EU", "VOEU0", "VOEU", ("Volts", "EU"), TRACE),
+    ]),
+    ("Input", [
+        enum("Source", "ISRC", "ISRC", ("A", "A-B")),
+        enum("Coupling", "ICPL", "ICPL", ("AC", "DC")),
+        enum("Grounding", "IGND", "IGND", ("Float", "Ground")),
+        num("Range (dBV)", "IRNG", "IRNG"),
+        enum("Auto range", "ARNG", "ARNG", ("Manual", "Auto")),
+        enum("Auto offset", "AOFM", "AOFM", ("Off", "On")),
+    ]),
+    ("Averaging", [
+        enum("Averaging", "AVGO", "AVGO", ("Off", "On")),
+        num("Number", "NAVG", "NAVG"),
+        enum("Type", "AVGT", "AVGT", ("RMS", "Vector", "Peak hold")),
+        enum("Mode", "AVGM", "AVGM", ("Linear", "Exponential")),
+        num("Overlap (%)", "OVLP", "OVLP"),
+    ]),
+    ("Display", [
+        enum("Active trace", "ACTG", "ACTG", ("Trace 0", "Trace 1")),
+        # Single/dual and linked markers are global underneath: they answer
+        # the plain query and take a single parameter, so "FMTS 0,1" sets
+        # nothing but the leading 0.
+        enum("Format", "FMTS0", "FMTS", ("Single", "Dual"), TRACE,
+             first_indexed=False),
+        enum("Grid", "GRID0", "GRID", ("Off", "8 div", "10 div"), TRACE),
+        enum("Style", "FILS0", "FILS", ("Line", "Filled"), TRACE),
+        enum("X axis", "XAXS0", "XAXS", ("Linear", "Log"), TRACE),
+        enum("Expand", "EXPD0", "EXPD",
+             ("8 bins", "15 bins", "30 bins", "64 bins", "128 bins",
+              "No expand"), TRACE),
+        enum("Marker", "MRKR0", "MRKR", ("Off", "On", "Track"), TRACE),
+        enum("Marker width", "MRKW0", "MRKW", ("Norm", "Wide", "Spot"), TRACE),
+        enum("Marker seek", "MRKM0", "MRKM", ("Max", "Min", "Mean"), TRACE),
+        enum("Linked markers", "MRLK0", "MRLK", ("Off", "On"), TRACE,
+             first_indexed=False),
+    ]),
+]
+ALL_SETTINGS = [s for _, group in SETTING_GROUPS for s in group]
+BY_KEY = {s.key: s for s in ALL_SETTINGS}
+
+# Two presets, because one block cannot be both a reproduction of history and a
+# statement of current discipline. Staged in the panel rather than written, so
+# nothing reaches the analyzer without being looked at first.
+PRESETS = {
+    # Byte-identical to what the read_sr760fft_data bench scripts set at the top
+    # of every run, ARNG:1 and NAVG:1000 included. Kept as history: this is what
+    # the old data was taken under, and it is what to load to reproduce it. Auto
+    # range is right for a survey and wrong for every comparison.
+    "legacy": {
+        "SPAN": "11", "STRF": "0", "WNDO": "2",
+        "MEAS0": "1", "DISP0": "0", "UNIT0": "1", "VOEU0": "0",
+        "ISRC": "0", "ICPL": "0", "IGND": "0", "ARNG": "1", "AOFM": "1",
+        "AVGO": "1", "NAVG": "1000", "AVGT": "0", "AVGM": "0",
+        "ACTG": "0", "FMTS0": "0", "GRID0": "2", "FILS0": "0", "XAXS0": "0",
+        "EXPD0": "5", "MRKR0": "2", "MRKW0": "0", "MRKM0": "0", "MRLK0": "0",
+    },
+    # The RIN validation protocol. Differences from legacy that matter:
+    #
+    #   ARNG 0   the range is pinned for a whole measurement set, so a range
+    #            step cannot masquerade as a step in the noise floor.
+    #   OVLP 0   no overlap, so NAVG IS the independent record count and
+    #            record_stats becomes a check on the run rather than a
+    #            correction to it. The wall clock cost is nothing at wide spans
+    #            and about 102 s at the 390 Hz span, which is affordable.
+    #   NAVG 100 enough for a 10% (0.41 dB) bin error, which is the accuracy the
+    #            segment overlaps are compared at.
+    #
+    # SPAN and STRF are deliberately absent: they are per-segment and belong in
+    # the set definition, not in a global preset that would silently move the
+    # band out from under a segment.
+    #
+    # MEAS0 1 + UNIT0 1 is PSD in Vrms, which trace_units() reports as
+    # "Vrms/sqrtHz" - the V/rtHz the RIN maths wants. DISP0 0 (LogMag) with volt
+    # units puts the plot on a log axis and keeps the fast binary readout valid.
+    "protocol": {
+        "WNDO": "2",
+        "MEAS0": "1", "DISP0": "0", "UNIT0": "1",
+        "ISRC": "0", "ICPL": "0", "ARNG": "0", "AOFM": "1",
+        "AVGO": "1", "NAVG": "100", "AVGT": "0", "AVGM": "0", "OVLP": "0",
+    },
+}
+
+# The old name. Anything that imported it keeps working and keeps meaning what
+# it said: the historical block.
+SCRIPT_DEFAULTS = PRESETS["legacy"]
+
+
+def averaging_fault(snap):
+    """Why this averaging setting invalidates a noise measurement, or "".
+
+    Two of the analyser's averaging modes are wrong for noise in a way that
+    looks right on the screen:
+
+    * Vector averaging averages the complex spectrum, so anything not
+      phase-locked to the trigger averages toward zero. On noise - which is all
+      of it - that produces a floor that falls forever as NAVG rises. It is
+      beautifully clean and completely wrong.
+    * Exponential averaging never settles on a count, so the trace is a running
+      weighted average of unknown depth and record_stats cannot say what it is
+      worth.
+
+    Checked on the snapshot taken with the trace, so a knob turned mid-set is
+    caught on the trace it affected rather than at the end of the run.
+    """
+    if code_of(snap, "AVGO", 0) != 1:
+        return ""                     # averaging off is a separate question
+    kind = label_of(snap, "AVGT")
+    if kind and kind != "RMS":
+        return (f"{kind.lower()} averaging: only RMS averaging measures noise, "
+                f"{kind.lower()} drives uncorrelated content toward zero")
+    mode = label_of(snap, "AVGM")
+    if mode and mode != "Linear":
+        return (f"{mode.lower()} averaging: the trace is a running average of "
+                f"no definite depth, so the statistics cannot be stated")
+    return ""
+
+
+def hold_notes(pinned_range, snap, set_name="", armed_at=""):
+    """Compare the range a trace was taken on against the pin.
+
+    Given the settings snapshot read straight after the average and before the
+    trace is transferred, so the answer describes the trace about to be written
+    rather than the state some time later. Returns (notes, ok).
+
+    A range that could not be read back is NOT clean: unverified and verified
+    are different claims, and only one of them belongs on a trace that a
+    comparison rests on.
+    """
+    if pinned_range is None:
+        return {}, True
+    notes = {"range hold": f"{pinned_range:g} dBV"
+                           + (f", set '{set_name}'" if set_name else "")
+                           + (f", armed {armed_at}" if armed_at else "")}
+    raw = snap.get("IRNG")
+    if raw is None:
+        notes["trace quality"] = ("SUSPECT: the range could not be read back, "
+                                  "so the pin is unverified")
+        return notes, False
+    try:
+        got = float(raw)
+    except (TypeError, ValueError):
+        notes["trace quality"] = f"SUSPECT: IRNG answered {raw!r}"
+        return notes, False
+    if got != pinned_range:
+        notes["trace quality"] = (
+            f"SUSPECT: the range moved to {got:g} dBV from the pinned "
+            f"{pinned_range:g} dBV, so this trace does not compare with the "
+            f"rest of the set")
+        return notes, False
+    notes["trace quality"] = "clean: range verified against the pin"
+    return notes, True
+
+
+# The analyser's two status bytes, decoded once and cached. See
+# SR760.refresh_status for why the caching is not an optimisation.
+ERRS_OVERLOAD_BIT = 7          # input overload
+FFTS_OVERLOAD_BIT = 5          # FFT overload
+
+
+class Status(namedtuple("Status", "errs ffts at")):
+    """One read of ERRS and FFTS, decoded. `at` is a perf_counter stamp."""
+
+    __slots__ = ()
+
+    @property
+    def overloaded(self) -> bool:
+        return bool(self.errs_bit(ERRS_OVERLOAD_BIT)
+                    or self.ffts_bit(FFTS_OVERLOAD_BIT))
+
+    def errs_bit(self, n):
+        return None if self.errs is None else bool(self.errs & (1 << n))
+
+    def ffts_bit(self, n):
+        return None if self.ffts is None else bool(self.ffts & (1 << n))
+
+    @property
+    def read(self) -> bool:
+        """Whether the analyser answered at all."""
+        return self.errs is not None or self.ffts is not None
+
+    def describe(self) -> str:
+        if not self.read:
+            return "unread"
+        if not self.overloaded:
+            return "no"
+        return (f"YES - ERRS bit {ERRS_OVERLOAD_BIT} "
+                f"{'set' if self.errs_bit(ERRS_OVERLOAD_BIT) else 'clear'}, "
+                f"FFTS bit {FFTS_OVERLOAD_BIT} "
+                f"{'set' if self.ffts_bit(FFTS_OVERLOAD_BIT) else 'clear'}")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def safe_name(name):
+    """Turn typed text into something safe to put in a CSV header or a file
+    name: ASCII word characters only, so no delimiter or encoding surprises."""
+    out = "".join(c if (c.isascii() and (c.isalnum() or c in "-.")) else "_"
+                  for c in name.strip())
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
+def unique_base(path, base, suffixes):
+    """First of '<base>', '<base>_1', '<base>_2' ... for which none of
+    `suffixes` exists yet, returned as a path with no suffix on it. Testing
+    every suffix together keeps the csv, png and txt of one capture sharing a
+    name instead of drifting apart by a counter."""
+    name, n = base, 0
+    while any(os.path.exists(os.path.join(path, name + suffix))
+              for suffix in suffixes):
+        n += 1
+        name = f"{base}_{n}"
+    return os.path.join(path, name)
+
+
+def fmt_setting(s, raw):
+    """Normalise an analyzer reply into what the panel displays. An unexpected
+    reply is shown as it arrived rather than swallowed."""
+    raw = (raw or "").strip()
+    if s.kind == "enum":
+        try:
+            return s.choices[int(float(raw))]
+        except (ValueError, IndexError):
+            return raw
+    try:
+        return f"{float(raw):g}"
+    except ValueError:
+        return raw
+
+
+def parse_setting(s, shown):
+    """Panel text back to the code the analyzer expects. Raises ValueError on
+    anything that is not a listed choice or a number."""
+    shown = shown.strip()
+    if s.kind == "enum":
+        return str(s.choices.index(shown))
+    return f"{float(shown):g}"
+
+
+def parse_list(text):
+    """Comma or space separated numbers, or 'start:stop:step'. An empty box
+    gives [], which callers read as 'leave the instrument where it is'."""
+    text = text.strip()
+    if not text:
+        return []
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 3:
+            raise ValueError("ranges are start:stop:step")
+        first, last, step = (float(p) for p in parts)
+        if step == 0:
+            raise ValueError("step cannot be 0")
+        out, value = [], first
+        while (value <= last + 1e-9) if step > 0 else (value >= last - 1e-9):
+            out.append(value)
+            value += step
+            if len(out) > 2000:
+                raise ValueError("that range is more than 2000 steps")
+        return out
+    return [float(p) for p in text.replace(",", " ").split()]
+
+
+def code_of(snap, key, default=None):
+    """One instrument code out of a settings snapshot, as an int."""
+    try:
+        return int(float(snap[key]))
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def label_of(snap, key, default=""):
+    """The wording an enum code stands for, or `default` when the snapshot has
+    nothing usable under that key."""
+    s, code = BY_KEY.get(key), code_of(snap, key)
+    if s is None or code is None or not 0 <= code < len(s.choices or ()):
+        return default
+    return s.choices[code]
+
+
+def trace_units(snap):
+    """Y-axis label implied by the measurement and unit codes, in plain ASCII -
+    it goes in the CSV header and the metadata as well as on the plot.
+
+    UNIT alone decides the scale the data comes back on. The display mode does
+    not: a LogMag display with Vpk units still answers SPEC? in volts. This was
+    measured, not assumed - a floor the analyzer drew at 10 nV/sqrtHz, and
+    called -161 dBV/sqrtHz once its units were switched to dBV, is 1e-8 V, and
+    that is what SPEC? returned while the display was on LogMag. The old rule
+    here claimed dB whenever the display was LogMag, which mislabelled every
+    volt-unit trace and, worse, let the binary dump rebase a dB trace with a
+    linear number. PSD adds the per root hertz that a spectrum does not have."""
+    meas = code_of(snap, "MEAS0", 0)
+    disp = code_of(snap, "DISP0", 0)
+    unit = code_of(snap, "UNIT0", 2)
+    if unit not in (0, 1, 2, 3):
+        unit = 2
+    if disp == 4:                                     # phase
+        return "deg" if unit == 0 else "rad"
+    label = ("Vpk", "Vrms", "dBV", "dBVrms")[unit]
+    if meas == 1:                                     # PSD
+        label += "/sqrtHz"
+    return label
+
+
+def pretty_units(label):
+    """The same label for a plot axis, where the root sign can be drawn."""
+    return label.replace("/sqrtHz", "/√Hz")
+
+
+def reads_in_db(snap):
+    """Whether the trace comes back in dB rather than in volts."""
+    return code_of(snap, "UNIT0", 2) in (2, 3)
+
+
+def trace_yscale(snap):
+    """The y axis the analyzer is drawing this trace on, so the plot matches the
+    screen: "log" or "linear".
+
+    Only volt data ever gets a log axis. dB data is a log axis already - taking
+    the log of it again means nothing, and a dB reading is usually negative,
+    which a log axis cannot draw at all. Of the display modes only LogMag is
+    logarithmic: Real and Imag are signed linear quantities and Phase is degrees
+    or radians."""
+    if reads_in_db(snap):
+        return "linear"
+    return "log" if code_of(snap, "DISP0", 0) == 0 else "linear"
+
+
+def binary_valid(snap):
+    """Whether the SPEB? dump can be used for the readout in force. The counts
+    are a dB mapping of the LogMag display, so the display has to be on it."""
+    return code_of(snap, "DISP0", 0) == 0
+
+
+def span_hz(code):
+    return SPANS[code][1] if 0 <= code < len(SPANS) else float("nan")
+
+
+def record_time(span_code, n_bins=N_BINS):
+    """The analyzer's own record length, bins / span, in seconds.
+
+    35 minutes at the 191 mHz span and 4 ms at 100 kHz, which is why every
+    settling and averaging time in this module is quoted in record lengths
+    rather than in seconds."""
+    hz = span_hz(span_code) if span_code is not None else float("nan")
+    return n_bins / hz if hz and np.isfinite(hz) and hz > 0 else float("nan")
+
+
+def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS):
+    """How much independent averaging a run actually bought.
+
+    NAVG counts records the analyzer averaged, not independent ones. With OVLP
+    above zero the records share samples, so they carry less information than
+    their count suggests - at 90% overlap ten records hold about the same as
+    two, and the reported NAVG overstates the statistics several-fold. What the
+    error bar actually rests on is how long the run was in units of the record
+    length:
+
+        T_rec   = bins / span            the analyzer's own record length
+        N_indep = elapsed / T_rec        records that did not share samples
+        rel_err = 1 / sqrt(N_indep)      1-sigma on an RMS-averaged PSD bin
+
+    rel_err is the fractional error on the power in a bin, so a value of 0.1
+    is +/- 10%, about +/- 0.41 dB. It is the honest bar to put on a segment
+    before comparing it with its neighbour.
+
+    Returns a dict of plain numbers; NaN wherever the inputs do not support the
+    calculation rather than a guess."""
+    t_rec = record_time(span_code, n_bins)
+    elapsed = float(elapsed_s)
+    n_indep = elapsed / t_rec if np.isfinite(t_rec) and t_rec > 0 else float("nan")
+    rel_err = (1.0 / np.sqrt(n_indep)
+               if np.isfinite(n_indep) and n_indep > 0 else float("nan"))
+    out = {"t_rec_s": t_rec, "elapsed_s": elapsed, "n_indep": n_indep,
+           "rel_err": rel_err, "navg": navg, "overlap_pct": ovlp}
+    # The ratio is the point of the whole calculation: it says how far NAVG is
+    # from what the run can actually support.
+    out["navg_over_indep"] = (navg / n_indep
+                              if navg and np.isfinite(n_indep) and n_indep > 0
+                              else float("nan"))
+    return out
+
+
+def stats_notes(stats):
+    """`record_stats` as the lines that go in the metadata file."""
+    def g(key, fmt="{:.4g}"):
+        v = stats.get(key)
+        return fmt.format(v) if isinstance(v, (int, float)) and np.isfinite(v) \
+            else "?"
+    notes = {
+        "record length T_rec (s)": g("t_rec_s"),
+        "independent records": g("n_indep", "{:.1f}"),
+        "relative error (1 sigma)": g("rel_err", "{:.3g}"),
+        "relative error (dB)": (f"{10 * np.log10(1 + stats['rel_err']):.2f}"
+                                if np.isfinite(stats.get("rel_err", np.nan))
+                                else "?"),
+    }
+    if stats.get("navg"):
+        notes["averages reported (NAVG)"] = f"{stats['navg']:g}"
+        ratio = stats.get("navg_over_indep", float("nan"))
+        if np.isfinite(ratio):
+            notes["NAVG / independent"] = (
+                f"{ratio:.2f}" + ("  <- NAVG overstates the statistics"
+                                  if ratio > 1.5 else ""))
+    if stats.get("overlap_pct") is not None:
+        notes["overlap (%)"] = f"{stats['overlap_pct']:g}"
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# Instrument layer
+# ---------------------------------------------------------------------------
+
+class SR760:
+    """The SR760 over GPIB. One VISA session, so every exchange the GUI makes
+    is serialised through the worker thread."""
+
+    def __init__(self, addr=None, resource_manager=None, connect=True,
+                 log=None):
+        """connect=False builds the object without touching the bus, for a
+        caller that opens the instrument later from a worker thread - which is
+        what the panel does, so the GUI stays responsive while VISA blocks.
+
+        `resource_manager`, if given, is never closed by this object. A process
+        driving both this and the scope must hand the same RM to both: a second
+        ResourceManager half-loads on this machine and then fails every
+        open_resource with VI_ERROR_ALLOC. See ilc_bench._shared_rm.
+        """
+        self._given_rm = resource_manager
+        self.rm = None
+        self.inst = None
+        self.idn = ""
+        self.addr = addr or ""
+        self.log = log if log is not None else (lambda _msg: None)
+        # Which spelling of each command this analyzer turned out to answer,
+        # and how many times a setting has failed to answer at all.
+        self.qform = {}
+        self.dead = {}
+        self.last_raw = {}
+        self._status = None
+        if connect:
+            self.connect(addr)
+
+    @property
+    def connected(self) -> bool:
+        return self.inst is not None
+
+    def connect(self, addr=None):
+        self.close()
+        self.rm = self._given_rm or pyvisa.ResourceManager()
+        if addr:
+            candidates = [addr]
+        else:
+            candidates = [r for r in self.rm.list_resources()
+                          if r.upper().startswith("GPIB")]
+        if not candidates:
+            raise RuntimeError("No GPIB resources found - check the cable and "
+                               "that NI MAX sees the SR760.")
+        problems = []
+        for res in candidates:
+            dev = None
+            try:
+                dev = self.rm.open_resource(res)
+                dev.timeout = CONNECT_TIMEOUT_MS
+                # The SR760 ends a command at the first line feed, and pyvisa's
+                # default terminator leaves a stray carriage return behind it,
+                # so pin the write terminator down. Replies finish on EOI, which
+                # is why nothing is set for reads.
+                dev.write_termination = "\n"
+                try:
+                    idn = dev.query("*IDN?").strip()
+                except Exception:
+                    # An analyzer left on the RS232 output takes GPIB commands
+                    # but answers down the serial port, so the first query just
+                    # times out. Point the output back at GPIB and ask again -
+                    # this is the "*IDN? always times out" the scripts lived with.
+                    dev.clear()
+                    dev.write("OUTP 1")
+                    idn = dev.query("*IDN?").strip()
+            except Exception as exc:
+                problems.append(f"  {res}: {exc}")
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                continue
+            # A typed address is taken at its word; a scan only claims an SR760.
+            if addr or "SR760" in idn.upper():
+                dev.timeout = OP_TIMEOUT_MS
+                self.inst, self.idn, self.addr = dev, idn, res
+                return idn
+            problems.append(f"  {res}: not an SR760 ({idn})")
+            dev.close()
+        raise RuntimeError("No SR760 found.\n" + "\n".join(problems))
+
+    def close(self):
+        # A given ResourceManager belongs to the caller and outlives us.
+        for obj in (self.inst, None if self.rm is self._given_rm else self.rm):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
+        self.inst = self.rm = None
+
+    # -- primitives -------------------------------------------------------
+
+    def put(self, cmd):
+        self.inst.write(cmd)
+
+    def get(self, query):
+        return self.inst.query(query).strip()
+
+    def recover(self):
+        """Flush a half-finished exchange after a timeout, so the next query
+        cannot read the previous reply."""
+        try:
+            self.inst.clear()
+        except Exception:
+            pass
+
+    def pin_range(self, dbv):
+        """Put the input range on manual and hold it at `dbv`.
+
+        ARNG has to go to manual first: writing IRNG while auto range is on
+        sets a value the analyzer is free to move off again on the next
+        overload, which is the whole failure this exists to stop."""
+        self.put("ARNG 0")
+        self.put(f"IRNG {dbv:g}")
+
+    def input_range(self):
+        """The range the analyzer says it is on, as a float, or None."""
+        try:
+            return float(self.get("IRNG?"))
+        except Exception:
+            self.recover()
+            return None
+
+    def lock_panel(self, locked):
+        """OVRM 0 locks the front panel for the duration of a measurement, so a
+        stray knob cannot change the settings the metadata says were used."""
+        self.put("OVRM 0" if locked else "OVRM 1")
+
+    def autoscale(self):
+        self.put("AUTS 0")
+
+    def wait_ready(self, probe=READY_PROBE, timeout=READY_TIMEOUT_S, poll=0.4):
+        """Block until the analyzer answers `probe` again; return how long that
+        took, or None if it never did.
+
+        Auto offset is the command this exists for. It runs on the analyzer for
+        several seconds with the bus ignored, so the settings read that used to
+        follow it straight away lost its first few queries to a timeout each -
+        the SPAN?/STRF?/CTRF? run of failures. Each probe is given a short
+        timeout of its own and the previous half-finished exchange is flushed
+        between tries, so nothing is left in the buffer for the next query to
+        read as its own reply."""
+        previous = self.inst.timeout
+        self.inst.timeout = READY_POLL_MS
+        t0 = time.time()
+        try:
+            while True:
+                try:
+                    self.get(probe)
+                    return time.time() - t0
+                except Exception:
+                    self.recover()
+                if time.time() - t0 >= timeout:
+                    return None
+                time.sleep(poll)
+        finally:
+            self.inst.timeout = previous
+
+    # -- acquisition ------------------------------------------------------
+
+    def autorange(self, seconds, stop=None, poll=0.5):
+        """Step the input range down to the most sensitive setting that does not
+        overload, then freeze it.
+
+        Auto range walks the range up from -60 dBV until the overload clears, so
+        it needs to be left on long enough to settle before going back to
+        manual - otherwise a later run in the same sweep moves the range and the
+        noise floors no longer compare. Returns the range it settled on and how
+        often an overload bit showed up while it worked."""
+        self.put("ARNG 0")
+        self.put("ARNG 1")
+        overloads = polls = 0
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if stop is not None and stop():
+                break
+            # Through the same cached read as everything else, so there is one
+            # code path and one pair of queries.
+            st = self.refresh_status()
+            if not st.read:
+                break
+            polls += 1
+            if st.overloaded:
+                overloads += 1
+            time.sleep(poll)
+        self.put("ARNG 0")
+        try:
+            rng = self.get("IRNG?")
+        except Exception:
+            self.recover()
+            rng = "?"
+        return rng, overloads, polls
+
+    def bin_spacing(self, trace, n_bins):
+        """Hz between neighbouring bins at the span the analyzer is on.
+
+        Read from the instrument rather than worked out from the span table:
+        the table holds the manual's printed values, which are rounded (390 Hz
+        for a span that is really 390.625), and that error would accumulate into
+        a visible misalignment over a long stitch.
+
+        Measured across the whole trace rather than between two adjacent bins.
+        The analyzer prints its bin frequencies to a handful of digits, and
+        differencing neighbours would keep all of that rounding while
+        differencing end to end divides it by the number of intervals. It also
+        makes the spacing the same one trace_binary lays into the frequency
+        column of the CSV, so a stitch overlap lands on the saved points."""
+        first = self.inst.query_ascii_values(f"BVAL? {trace},0")[0]
+        last = self.inst.query_ascii_values(f"BVAL? {trace},{n_bins - 1}")[0]
+        return (last - first) / (n_bins - 1)
+
+    def start(self):
+        """Restart the average. Same as the [START] key.
+
+        Drops the cached status: a flag raised before a run says nothing about
+        the run, and a stale-but-plausible overload reading is worse than none.
+        """
+        self.invalidate_status()
+        self.put("STRT")
+
+    def wait_done(self, timeout, stop=None, poll=0.25):
+        """Wait for the averaged measurement to finish.
+
+        Bit 0 of the serial poll byte is clear while a measurement runs, so the
+        poll starts after a short settle: asking immediately can catch the bit
+        still set from the previous run and return at once. Returns 'done',
+        'timeout', 'stopped' or 'error'."""
+        time.sleep(0.5)
+        deadline = time.time() + timeout
+        misses = 0
+        while time.time() < deadline:
+            if stop is not None and stop():
+                return "stopped"
+            try:
+                if int(self.get("*STB?0")):
+                    return "done"
+                misses = 0
+            except Exception:
+                self.recover()
+                misses += 1
+                if misses >= 3:
+                    return "error"
+            time.sleep(poll)
+        return "timeout"
+
+    def trace_ascii(self, trace, n_bins, progress=None):
+        """Bin-by-bin ASCII readout: two queries per bin, so slow, but valid
+        whatever the display is set to."""
+        freqs, amps = [], []
+        for i in range(n_bins):
+            f = self.inst.query_ascii_values(f"BVAL? {trace},{i}")[0]
+            time.sleep(0.0005)   # the analyzer drops replies if pushed harder
+            a = self.inst.query_ascii_values(f"SPEC? {trace},{i}")[0]
+            time.sleep(0.0005)
+            freqs.append(f)
+            amps.append(a)
+            if progress is not None and (i + 1) % 100 == 0:
+                progress(i + 1, n_bins)
+        return np.array(freqs), np.array(amps)
+
+    def trace_binary(self, trace, n_bins, in_db=True):
+        """SPEB? dump: the whole trace as int16 display counts in one read, some
+        two orders of magnitude faster than asking bin by bin.
+
+        The counts carry a dB mapping, so this is only valid while the display
+        is LogMag - the caller checks before choosing it. Bin 0 is also read the
+        slow way with SPEC? and used to put the dump back on the analyzer's own
+        scale, which absorbs whatever reference the chosen units imply.
+
+        `in_db` says which scale SPEC? is answering on, which is decided by UNIT
+        and nothing else. On dBV or dBVrms the rebase is a straight offset. On
+        Vpk or Vrms it is not: SPEC? hands back volts, and adding a linear value
+        to a dB trace pinned bin 0 near zero and dragged the rest of the trace
+        with it - a floor the analyzer drew at 10 nV/sqrtHz came out of the app
+        at about 0 dBVpk/sqrtHz, some 160 dB adrift. So bin 0 goes into dB for
+        the rebase and the whole trace comes back out of it afterwards; 20 log10
+        is the right conversion here, the same one that makes the analyzer's own
+        10 nV/sqrtHz and -161 dBV/sqrtHz two readings of one noise floor."""
+        start_freq = self.inst.query_ascii_values(f"BVAL? {trace},0")[0]
+        stop_freq = self.inst.query_ascii_values(f"BVAL? {trace},{n_bins - 1}")[0]
+        freqs = np.linspace(start_freq, stop_freq, n_bins)
+
+        first_bin = self.inst.query_ascii_values(f"SPEC? {trace},0")[0]
+        if not in_db and not first_bin > 0:
+            # No dB reference to rebase against, so say so and let the caller
+            # fall back rather than return a trace that is quietly wrong.
+            raise ValueError(f"bin 0 reads {first_bin:g}, which has no dB "
+                             f"equivalent to rebase the binary dump against")
+        self.inst.write(f"SPEB? {trace}")
+        raw = self.inst.read_bytes(2 * n_bins, break_on_termchar=False)
+        counts = np.frombuffer(raw, dtype="<i2")
+        amps = (3.0103 * counts) / 512.0 - 114.3914
+        if in_db:
+            return freqs, amps + (first_bin - amps[0])
+        amps = amps + (20.0 * np.log10(first_bin) - amps[0])
+        return freqs, 10.0 ** (amps / 20.0)
+
+    # -- status ------------------------------------------------------------
+
+    def refresh_status(self, log=None):
+        """Read ERRS and FFTS once and cache the decoded result.
+
+        **Reading a status byte clears it**, so whoever reads first consumes the
+        flag and everyone after them sees a clean instrument. That made the
+        overload check a race: report_status() after a settings apply, or a
+        second caller wanting the same answer, would swallow the bit the capture
+        was about to look for. So there is exactly one read, here, and
+        error_byte(), overload() and status_line() all report from the cache.
+
+        start() invalidates the cache, because a flag raised before a run says
+        nothing about the run. If nothing has refreshed since, overload()
+        refreshes rather than returning a pre-capture value - stale-but-plausible
+        is the failure this exists to stop.
+
+        The whole byte is read rather than a single bit: it costs the same two
+        queries and keeps every other bit available for the caller who wants it.
+        """
+        errs = ffts = None
+        for query, slot in (("ERRS?", "errs"), ("FFTS?", "ffts")):
+            try:
+                value = int(self.get(query))
+            except Exception:
+                self.recover()
+                value = None
+            if slot == "errs":
+                errs = value
+            else:
+                ffts = value
+        self._status = Status(errs=errs, ffts=ffts, at=time.perf_counter())
+        if log is not None and self._status.overloaded:
+            log("  *** OVERLOAD flagged. The front end saturated; content "
+                "outside the span can do that without showing on the trace. ***")
+        return self._status
+
+    def status(self, refresh_if_stale=True):
+        """The cached status, refreshing first if nothing has read since the
+        last start()."""
+        if self._status is None and refresh_if_stale:
+            self.refresh_status()
+        return self._status
+
+    def invalidate_status(self):
+        """Forget the cached flags. Called by start(); call it yourself after
+        anything that makes the previous read irrelevant."""
+        self._status = None
+
+    def error_byte(self):
+        """SR760 error status byte, from the cache. The manual's ERRS table
+        names the individual bits; bit 7 is the input overload."""
+        st = self.status()
+        return 0 if st is None or st.errs is None else st.errs
+
+    def overload(self):
+        """(ERRS bit 7, FFTS bit 5) from the cache, refreshing if stale.
+
+        Worth asking after every average, not just while ranging. The input
+        stage sees the whole band the anti-alias filter passes, so content
+        outside the span can overload it while the displayed trace looks
+        perfectly clean - a servo bump at 150-300 kHz, or RF on an unterminated
+        line, do exactly that. A trace taken through a saturated front end is
+        not a measurement of anything, and nothing on the screen says so.
+        """
+        st = self.status()
+        if st is None:
+            return None, None
+        return st.errs_bit(ERRS_OVERLOAD_BIT), st.ffts_bit(FFTS_OVERLOAD_BIT)
+
+    def status_line(self):
+        """One line about anything the analyser is complaining about, or "".
+
+        Bit 7 is the input overload the ranging routine watches; it says nothing
+        about the commands just sent, so it is called out separately rather than
+        read as a rejection.
+        """
+        err = self.error_byte()
+        if not err:
+            return ""
+        bits = [i for i in range(8) if err & (1 << i)]
+        if bits == [ERRS_OVERLOAD_BIT]:
+            return ("input overload flagged - ERRS bit 7. Not a rejected "
+                    "command; check the input range.")
+        return f"ERRS = {err}, bits {bits} set - see the ERRS table in the manual"
+
+    # -- settings ----------------------------------------------------------
+
+    def command(self, key, value):
+        """The write for a setting, in the spelling its query turned out to use.
+        Falls back to the likelier spelling for a setting that has never been
+        read back successfully."""
+        s = BY_KEY[key]
+        return s.writes[self.qform.get(key, 0)].format(v=value)
+
+    def query_for(self, key):
+        """The read for a setting, in the spelling that answered last time."""
+        s = BY_KEY[key]
+        return s.queries[self.qform.get(key, 0)]
+
+    def read_settings(self, *keys):
+        """A few settings rather than all of them, each in the query form it
+        turned out to answer.
+
+        A query that fails falls back to the last value this session read
+        successfully, so a decision made on the answer rests on a stale reading
+        rather than on a default that happens to be wrong.
+        """
+        out = {}
+        for key in keys:
+            try:
+                out[key] = self._remember(key, self.get(self.query_for(key)))
+                continue
+            except Exception:
+                self.recover()
+            if key in self.last_raw:
+                out[key] = self.last_raw[key]
+        return out
+
+    def read_all_settings(self, retry_all=False, log=None):
+        """Every setting the model knows, as {key: raw reply}.
+
+        Each is asked with the query form that worked last time, or with each
+        candidate form in turn the first time round. A setting nothing answers
+        costs a whole VISA timeout per form, so one that fails twice is dropped
+        until the next explicit retry_all - it stays editable and writable, it
+        just cannot be read back.
+        """
+        say = log if log is not None else (lambda _msg: None)
+        if retry_all:
+            self.dead.clear()
+            self.qform.clear()
+        values = {}
+        previous = self.inst.timeout
+        self.inst.timeout = SETTINGS_TIMEOUT_MS
+        try:
+            for s in ALL_SETTINGS:
+                if self.dead.get(s.key, 0) >= 2:
+                    continue
+                known = self.qform.get(s.key)
+                tries = (s.queries[known],) if known is not None else s.queries
+                failure = ""
+                for query in tries:
+                    try:
+                        values[s.key] = self._remember(s.key, self.get(query))
+                    except Exception as exc:
+                        self.recover()
+                        failure = f"{query} failed: {exc}"
+                        continue
+                    if known is None:
+                        self.qform[s.key] = s.queries.index(query)
+                        if query != s.queries[0]:
+                            say(f"  ({s.label} answers {query}, "
+                                f"not {s.queries[0]})")
+                    self.dead[s.key] = 0
+                    break
+                else:
+                    self.dead[s.key] = self.dead.get(s.key, 0) + 1
+                    say(f"  {failure}")
+                    if self.dead[s.key] >= 2:
+                        say(f"  ({s.label} cannot be read back - leaving it "
+                            f"write-only until the next Read)")
+        finally:
+            self.inst.timeout = previous
+        return values
+
+    def _remember(self, key, raw):
+        self.last_raw[key] = raw
+        return raw
+
+    def write_settings(self, changes, log=None):
+        """Write {key: code}, each in the spelling that key answers to.
+
+        Returns the commands sent. The caller is expected to read back
+        afterwards: the analyser clamps a value it dislikes and says nothing.
+        """
+        say = log if log is not None else (lambda _msg: None)
+        sent = []
+        for key, value in changes.items():
+            cmd = self.command(key, value)
+            self.put(cmd)
+            sent.append(cmd)
+            say(f"  {cmd}")
+        return sent
+
+    def apply(self, preset, log=None):
+        """Write a whole preset. `PRESETS['protocol']` is the usual argument."""
+        return self.write_settings(dict(preset), log=log)
+
+    def average_finishes(self):
+        """Whether an average started now will ever report itself finished, and
+        a short phrase naming the averaging.
+
+        Bit 0 of the poll byte sets when a linear average reaches its count. An
+        exponential average never reaches one - it goes on re-weighting the
+        newest record forever - and with averaging off nothing is counting at
+        all, so in both cases the bit wait_done watches for is never coming and
+        the wait can only end at the timeout or at Stop.
+
+        Asked of the analyser rather than assumed, because the averaging mode is
+        one knob turn away on the front panel and this is the difference between
+        a wait that ends and one that does not.
+        """
+        snap = self.read_settings("AVGO", "AVGM", "NAVG")
+        if code_of(snap, "AVGO", 0) != 1:
+            return False, "no averaging"
+        if code_of(snap, "AVGM", 0) != 0:
+            return False, "exponential averaging"
+        n = code_of(snap, "NAVG")
+        return True, f"{n} linear averages" if n else "linear averaging"
+
+    # -- timing ------------------------------------------------------------
+
+    def dwell(self, seconds, stop=None, poll=0.25):
+        """Sleep in short steps so a stop request is felt promptly.
+
+        Answers in wait_done's vocabulary - 'done' or 'stopped' - so the two are
+        interchangeable at the call sites.
+        """
+        deadline = time.time() + seconds
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return "done"
+            if stop is not None and stop():
+                return "stopped"
+            time.sleep(min(poll, left))
+
+    def settle(self, recs, span_code, stop=None, log=None):
+        """Wait out the decimation chain after a change of span, start
+        frequency, range or coupling, and say what was waited.
+
+        In record lengths, because that is what the analyser's settling actually
+        scales with: at the 191 mHz span a record is 35 minutes and at 100 kHz
+        it is 4 ms, so a fixed number of seconds is either uselessly long at one
+        end or no wait at all at the other.
+
+        wait_ready() does not cover this. That waits for the analyser to answer
+        a query again, which it does perfectly happily while its filters are
+        still full of the previous span's data.
+
+        Raises KeyboardInterrupt if `stop` fires, matching the capture path.
+        """
+        say = log if log is not None else (lambda _msg: None)
+        t_rec = record_time(span_code)
+        if not (recs > 0) or not np.isfinite(t_rec):
+            return {"settle": "none"}
+        seconds = recs * t_rec
+        say(f"  settling {recs:g} record lengths = {seconds:.3g} s "
+            f"(T_rec {t_rec:.4g} s)")
+        if self.dwell(seconds, stop=stop) == "stopped":
+            raise KeyboardInterrupt
+        return {"settle": f"{recs:g} record lengths = {seconds:.4g} s "
+                          f"(T_rec {t_rec:.4g} s)"}
+
+    # -- readout -----------------------------------------------------------
+
+    def trace(self, trace=TRACE, n_bins=N_BINS, snap=None, prefer_binary=True,
+              progress=None, log=None):
+        """The trace, by whichever readout is valid for the current settings.
+
+        `snap` is a settings snapshot; without one it is read here. The display
+        mode decides whether the binary dump is usable and the units decide how
+        it has to be rebased, so both come from the same snapshot the caller
+        will put in the metadata.
+
+        Returns (freqs, amps, used_binary).
+        """
+        say = log if log is not None else (lambda _msg: None)
+        if snap is None:
+            snap = self.read_all_settings()
+        binary = prefer_binary and binary_valid(snap)
+        if prefer_binary and not binary:
+            say("  (linear display: falling back to the ASCII readout, the "
+                "binary dump is a dB mapping)")
+        if binary:
+            try:
+                freqs, amps = self.trace_binary(trace, n_bins, reads_in_db(snap))
+                return freqs, amps, True
+            except ValueError as exc:
+                say(f"  ({exc} - reading bin by bin instead)")
+        freqs, amps = self.trace_ascii(trace, n_bins, progress=progress)
+        return freqs, amps, False
+
+    # -- context manager ---------------------------------------------------
+
+    def __enter__(self):
+        if self.inst is None:
+            self.connect(self.addr or None)
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+# The class was called Analyzer while it lived in the panel. Anything that
+# imports the old name keeps working.
+Analyzer = SR760
+
+
+# ---------------------------------------------------------------------------
+# Files
+# ---------------------------------------------------------------------------
+
+def write_csv(path, freqs, amps, ylabel):
+    """Two columns, headed the way the trace was actually measured rather than
+    with a fixed 'dbV' that goes stale as soon as the units change."""
+    rows = np.column_stack([freqs, amps])
+    np.savetxt(path, rows, delimiter=",", comments="",
+               header=f"Frequency (Hz),{safe_name(ylabel)}")
+
+
+def metadata_text(an, snap, extra, command):
+    """The capture described by the same settings snapshot the panel is showing,
+    so the two can never disagree about what the analyzer was doing. Each
+    setting is followed by the command that would put it back, in the spelling
+    this analyzer turned out to use."""
+    lines = [
+        f"captured             : {datetime.datetime.now().isoformat(timespec='seconds')}",
+        f"instrument           : {an.idn}",
+        f"visa address         : {an.addr}",
+    ]
+    for label, value in extra.items():
+        lines.append(f"{label:<21}: {value}")
+    lines.append("")
+    lines.append("analyzer settings")
+    for group, settings in SETTING_GROUPS:
+        lines.append(f"  [{group}]")
+        for s in settings:
+            raw = snap.get(s.key)
+            if raw is None:
+                continue
+            lines.append(f"    {s.label:<17}: {fmt_setting(s, raw):<14} "
+                         f"({command(s.key, raw)})")
+    return "\n".join(lines) + "\n"

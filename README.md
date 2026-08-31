@@ -43,12 +43,88 @@ nothing.
 The window needs matplotlib's Tk backend. A Python that has matplotlib but not
 that still saves plots and shows the preview; the button just says so.
 
+## Two files
+
+`sr760.py` is the instrument layer **and** the scripting library;
+`spectrum_grab.py` is the panel and imports it. Same split as
+[BK4063B-AWG-GUI](https://github.com/Weiss-Quantum-Computing/BK4063B-AWG-GUI):
+one copy of the command spellings, the settings model, the status handling and
+the file format, shared between the panel and anything that scripts the
+analyser. **`sr760.py` has to sit beside `spectrum_grab.py` for the panel to
+run.**
+
+```python
+from sr760 import SR760, PRESETS, TRACE, N_BINS
+
+with SR760() as an:                    # or SR760(connect=False) then .connect()
+    an.apply(PRESETS["protocol"])
+    an.pin_range(-30)
+    an.start()
+    an.wait_done(600)
+    an.refresh_status()                # one read; every reader shares the cache
+    f, a, used_binary = an.trace(TRACE, N_BINS)
+```
+
+`sr760.py` imports numpy and pyvisa and nothing else - no tkinter, no
+matplotlib, no pillow - so the headless protocol runner in Trek-EOM-ILC can
+import it on the bare system interpreter. The class is `SR760`, with
+`Analyzer = SR760` kept as an alias so older imports keep working.
+
+Writing files through the library is what makes a scripted capture
+indistinguishable from a panel one: `write_csv`, `metadata_text`, `safe_name`
+and `unique_base` all live there, so both produce the same names and the same
+metadata block.
+
+## Presets
+
+**Stage preset** puts a whole block in the panel without sending it, so it can
+be looked over before Apply. Two presets, because one block cannot be both a
+reproduction of history and a statement of current discipline:
+
+- **legacy** - byte-identical to what the `read_sr760fft_data` bench scripts set
+  at the top of every run, `ARNG:1` and `NAVG:1000` included. This is what the
+  old data was taken under and what to load to reproduce it.
+- **protocol** - the RIN validation discipline. `ARNG:0` because the range is
+  pinned for a whole set; `OVLP:0` because with no overlap `NAVG` **is** the
+  independent record count, so `record_stats` becomes a check on the run rather
+  than a correction to it; `NAVG:100` for a 10% (0.41 dB) bin error, which is
+  the accuracy segment overlaps are compared at. PSD in Vrms, which
+  `trace_units()` reports as `Vrms/sqrtHz` - the V/rtHz the RIN maths wants.
+  Span and start frequency are deliberately absent: they are per-segment and
+  belong in the measurement-set definition, not in a global preset that would
+  move the band out from under a segment.
+
+`SCRIPT_DEFAULTS` still exists and still means `PRESETS["legacy"]`.
+
+Two averaging modes are refused for noise work, by `averaging_fault()`. Vector
+averaging averages the complex spectrum, so anything not phase-locked to the
+trigger averages toward zero - on noise that is a floor which falls forever as
+NAVG rises, beautifully clean and completely wrong. Exponential averaging never
+settles on a count, so the statistics cannot be stated. Either one marks the
+trace `SUSPECT` in the metadata and on the plot; the protocol runner refuses to
+start at all.
+
+## The status byte is cached
+
+Reading an SR760 status byte **clears** it, so whoever reads first consumes the
+flag and everyone after them sees a clean instrument. `refresh_status()` does
+the one real read of `ERRS` and `FFTS`; `error_byte()`, `overload()` and
+`status_line()` all report from the cache. `start()` invalidates it, because a
+flag raised before a run says nothing about the run - and if nothing has
+refreshed since, `overload()` refreshes rather than returning a pre-capture
+value. Stale-but-plausible is the failure this exists to stop.
+
+The capture path calls `refresh_status()` exactly once, straight after
+`wait_done()`.
+
 ## Requirements
 
 - NI-488.2 (or any VISA with GPIB support). Check in NI MAX that the analyzer
   shows up, e.g. as `GPIB0::10::INSTR`.
 - Python 3.9+
 - `pip install pyvisa numpy matplotlib pillow`
+- `sr760.py` beside `spectrum_grab.py` - the panel imports the instrument
+  layer from it. Scripts need only that file, numpy and pyvisa.
 
 matplotlib and pillow are both optional in the sense that the app starts and
 captures without them: without matplotlib there are no plots and no preview
@@ -203,10 +279,9 @@ To change something, edit the field and press **Apply changes**:
 - The error status byte is read after every apply and anything non-zero is
   logged.
 
-**Defaults** stages the block of settings the bench scripts wrote at the top of
-every run - PSD, LogMag, Vrms, Hanning, 1000 linear RMS averages, input A, AC,
-float, auto range and auto offset on, 390 Hz span from 0 Hz. Nothing is sent
-until you press Apply, so you can look the whole block over first.
+**Stage preset** stages one of the two presets - see [Presets](#presets).
+Nothing is sent until you press Apply, so you can look the whole block over
+first.
 
 **Auto-offset** and **Auto-scale** send `AOFF` and `AUTS 0`. Auto offset runs
 on the analyzer for several seconds with the bus ignored, so the panel read that
