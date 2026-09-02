@@ -689,6 +689,13 @@ class App:
                                       command=self.do_compare_plot,
                                       state="disabled")
         self.compare_btn.pack(side="left", padx=6)
+        # The files are the record, and a comparison outlives the captures it
+        # was drawn against: a segment re-measured into the same name would go
+        # on being shown as it was when it was picked, possibly sessions ago.
+        self.compare_reload_btn = ttk.Button(row, text="Reload",
+                                             command=self.do_compare_reload,
+                                             state="disabled")
+        self.compare_reload_btn.pack(side="left", padx=(0, 6))
         self.compare_clear_btn = ttk.Button(row, text="Clear",
                                             command=self.do_compare_clear,
                                             state="disabled")
@@ -1078,7 +1085,14 @@ class App:
         }
 
     def current_cfg(self):
-        return {k: v.get() for k, v in self.config_vars().items()}
+        cfg = {k: v.get() for k, v in self.config_vars().items()}
+        # The loaded sequences travel with the rest of the session, by the same
+        # argument that keeps them across a grab: the reason to load last
+        # week's floor is to take this week's against it, and that is several
+        # bench sessions, not several captures. Paths, not data - the files are
+        # the record, and they are re-read at every start.
+        cfg["compare"] = self.compare_paths()
+        return cfg
 
     def load_config(self):
         """Restore what the last session was using. Anything missing, malformed
@@ -1101,6 +1115,11 @@ class App:
                     var.set(bool(value))
             elif isinstance(value, str):
                 var.set(value)
+        paths = cfg.get("compare")
+        if isinstance(paths, list):
+            paths = [p for p in paths if isinstance(p, str)]
+            if paths:
+                self.set_compare(paths, "restored from the last session")
         self.saved_cfg = self.current_cfg()
         self.log(f"Restored last session from {CONFIG_PATH}")
 
@@ -1476,6 +1495,40 @@ class App:
         self.log("Compare: cleared. Nothing is drawn underneath any more.")
         self.refresh_compare()
 
+    def compare_paths(self):
+        """Every file the loaded sequences were built from, in order."""
+        return [p for seq in self.compare for p in seq["paths"]]
+
+    def set_compare(self, paths, note):
+        """Load `paths` as the whole comparison, saying what happened.
+
+        One route for both the restore at startup and the Reload button,
+        because both are the same act - read this list off disk again - and
+        neither should keep a sequence whose files have gone. A segment that
+        has moved is counted rather than named: a folder that went with a USB
+        stick should not fill the log every time the panel starts.
+        """
+        gone = [p for p in paths if not os.path.exists(p)]
+        live = [p for p in paths if os.path.exists(p)]
+        self.compare = load_sequences(live, log=self.log) if live else []
+        self.said.clear()
+        self.log(f"Compare: {len(self.compare)} sequence(s) {note}")
+        if gone:
+            self.log(f"  ({len(gone)} file(s) no longer on disk, starting "
+                     f"with {os.path.basename(gone[0])})")
+        self.refresh_compare()
+
+    def do_compare_reload(self):
+        """Re-read the loaded sequences from disk.
+
+        Nothing else would notice a file changing: the arrays were read once,
+        when they were picked, and a comparison is meant to be kept across
+        captures - and now across sessions - while the folder underneath it
+        goes on being measured into."""
+        if self.busy or not self.compare:
+            return
+        self.set_compare(self.compare_paths(), "re-read from disk")
+
     def refresh_compare(self):
         """Main thread. Keep the compare line and its buttons telling the
         truth."""
@@ -1491,6 +1544,7 @@ class App:
                                           foreground="#666")
         state = "normal" if n and not self.busy else "disabled"
         self.compare_btn.configure(state=state)
+        self.compare_reload_btn.configure(state=state)
         self.compare_clear_btn.configure(state="normal" if n else "disabled")
 
     def compare_scale(self):

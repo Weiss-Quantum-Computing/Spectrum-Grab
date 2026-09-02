@@ -216,9 +216,11 @@ GOOD = {"SPAN": "11", "STRF": "0", "WNDO": "2", "MEAS0": "1", "DISP0": "0",
         "AVGO": "1", "NAVG": "100", "AVGT": "0", "AVGM": "0", "OVLP": "0"}
 
 
-def build_app(snap=None, errs=0, ffts=0, outdir=None):
+def build_app(snap=None, errs=0, ffts=0, outdir=None, extra=None):
     """A real App with every widget, the fake analyzer swapped in, and its
-    output pointed somewhere disposable."""
+    output pointed somewhere disposable. `extra` goes into the config file the
+    panel restores from, for the settings that are read at startup rather than
+    set afterwards."""
     outdir = outdir or TMP
     with open(sg.CONFIG_PATH, "w", encoding="utf-8") as fh:
         # Written rather than set afterwards so that load_latest_preview, which
@@ -226,7 +228,9 @@ def build_app(snap=None, errs=0, ffts=0, outdir=None):
         # json.dumps, not %r: a Python repr of a Windows path is not JSON, and
         # load_config would quietly reject the file and leave the default
         # output folder - the user's real one - in place.
-        json.dump({"outdir": outdir, "dated": False, "title": "sr760"}, fh)
+        cfg = {"outdir": outdir, "dated": False, "title": "sr760"}
+        cfg.update(extra or {})
+        json.dump(cfg, fh)
     root = tk.Tk()
     root.withdraw()
     # __init__ schedules a pump for 100 ms and an auto-connect for 300 ms. Every
@@ -1303,6 +1307,63 @@ app.do_compare_clear()
 ok("clearing empties it", app.compare == [] and app.refs_for("dBV") == [])
 ok("... and the panel says so",
    "nothing loaded" in app.compare_status.cget("text"))
+root.destroy()
+
+print("\n--- kept across sessions, and re-read ---")
+
+# A comparison outlived a grab and a sweep but not the panel, so a bench
+# session that spans days started every morning by picking the same files
+# again - by the argument that keeps it across captures, it should keep.
+root, app = build_app()
+app.compare = load_sequences(paths)
+app.save_config()
+with open(sg.CONFIG_PATH, encoding="utf-8") as fh:
+    written = json.load(fh)
+ok("the files behind the comparison are written to the config",
+   sorted(written.get("compare", [])) == sorted(paths),
+   str(len(written.get("compare", []))))
+root.destroy()
+
+root, app = build_app(extra={"compare": paths})
+ok("... and a new panel starts with them loaded", len(app.compare) == 3,
+   str(len(app.compare)))
+ok("... and says so", "3 sequence" in app.compare_status.cget("text"),
+   app.compare_status.cget("text")[:60])
+
+# Paths, not data: the files are the record, and one of them can be measured
+# again between the session that picked it and the session that draws it.
+seq = next(s for s in app.compare if s["name"].startswith("floor"))
+first = seq["paths"][0]
+f_, a_, u_ = S.read_csv(first)
+S.write_csv(first, f_, a_ + 7.0, u_)
+before = float(np.nanmax(seq["amps"]))
+clear_log(app)
+app.do_compare_reload()
+after = float(np.nanmax(
+    next(s for s in app.compare if s["name"].startswith("floor"))["amps"]))
+ok("Reload picks up a segment re-measured underneath it",
+   after == before + 7.0, f"{before} -> {after}")
+ok("... and says what it re-read", "re-read from disk" in logged(app),
+   logged(app)[:60])
+
+# A folder that went away with a USB stick is counted, not listed.
+os.remove(first)
+clear_log(app)
+app.do_compare_reload()
+ok("a file that has gone is dropped from its sequence",
+   next(s for s in app.compare if s["name"].startswith("floor"))["segments"]
+   == 1)
+ok("... and counted rather than named one per line",
+   logged(app).count("no longer on disk") == 1, logged(app)[:88])
+S.write_csv(first, f_, a_, u_)          # put the fixture back
+root.destroy()
+
+# A remembered comparison whose files are all gone leaves an empty panel, not
+# a traceback at startup.
+root, app = build_app(extra={"compare": [os.path.join(TMP, "not_here.csv")]})
+ok("a remembered file that no longer exists starts clean",
+   app.compare == []
+   and "nothing loaded" in app.compare_status.cget("text"))
 root.destroy()
 
 print("\n--- and under a building sweep ---")

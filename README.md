@@ -642,9 +642,14 @@ Loaded sequences show up in three places:
   the first loaded sequence's scale — the first whose units are recognised, so a
   stray headerless CSV cannot become a target nothing else can convert to.
 
-They outlive a grab and a sweep on purpose: the reason to load last week's floor
-is to take this week's against it, and that is several captures. **Clear** drops
-them. Nothing is ever written back to the files they came from.
+They outlive a grab, a sweep and the panel itself on purpose: the reason to load
+last week's floor is to take this week's against it, and that is several
+captures across several days. What is remembered is the *paths* — the files are
+the record — so the sequences are re-read at every start, and one that has moved
+since is dropped with a count rather than a wall of names. **Reload** does the
+same re-read on demand, for a segment measured again into its own name while the
+comparison sat there. **Clear** drops them. Nothing is ever written back to the
+files they came from.
 
 **Stitch to _x_ Hz, overlap _n_ points** fills the start-frequency box with
 segments that tile 0 Hz up to _x_ at the span the analyzer is on, stepping by
