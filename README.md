@@ -13,37 +13,46 @@ you get, in your chosen folder:
 | `<name>.png` | Plot of the trace |
 | `<name>.txt` | Metadata: span, start frequency, window, averaging, input range and every other setting, each with the command that would put it back |
 
-The panel shows the most recent plot inline; double-click it to open the
-full-resolution PNG, or press **Zoom / pan** for an interactive copy you can
-zoom into. **Peek** draws the trace into the preview box without writing
-anything, and **Start average** restarts the average and waits it out without
-writing anything either - so looking is never the same as collecting.
+The panel shows the most recent plot in a figure of its own that you can zoom
+and pan; **Open PNG** opens the full-resolution file. **Peek** draws the trace
+onto the panel without writing anything, and **Start average** restarts the
+average and waits it out without writing anything either - so looking is never
+the same as collecting.
 
-## Zoom and pan
+## The plot
 
-**Zoom / pan** under the preview opens the last plot in a window of its own,
-with matplotlib's navigation toolbar: rectangle zoom, pan, back, forward, Home
-and Save, the same set the ILC panel has. The toolbar prints the cursor's
+The last plot sits in the panel, under **Last plot**, drawn from the trace data
+rather than from the PNG and through the same drawing code the PNG goes through
+- so what you zoom into differs from the file on disk in nothing but the axis
+limits and the size of the text (the panel draws at the lab's 8 pt, the file at
+14 pt), log axis and settings line included. The toolbar prints the cursor's
 frequency and amplitude as you move, which is the quickest way to put a number
 on a peak.
 
-It is drawn from the trace data rather than from the PNG, through the same
-drawing code the PNG goes through - so what you zoom into differs from the file
-on disk in nothing but the axis limits, log axis and settings line included. A
-window rather than the preview box for two reasons: a spectrum is worth looking
-at large, and the preview has to go on showing PNGs this session did not draw,
-which have no trace data behind them to redraw from.
+The plot uses the lab's shared plot panel (labplot.py, vendored from Weiss-Quantum-Computing/lab-plot). Toolbar: Home, Back, Forward, Pan, Zoom, Save. Once you zoom or pan (toolbar or mouse wheel) the view is held across redraws and a blue note says 'zoomed - Home to auto-scale'; Home releases it. The mouse wheel zooms about the cursor (Shift keeps the x range, Ctrl keeps the y range) and each step goes on the Back stack. Right-click copies the cursor position as x<TAB>y to the clipboard. Save proposes a name and the output folder and writes PNG at 150 dpi.
+
+Save proposes `<title>_<case>.png`, or `<title>_spectrum.png` when the plot has
+no case. That is the panel's figure at 150 dpi; the capture's own PNG, written
+by the grab, is the 8x6 in, 300 dpi file it has always been.
+
+**Open PNG** opens the last saved plot in whatever opens PNGs. It is greyed
+while what is on screen is a peek or a sweep still building, which have no
+file. The caption above the figure says which: the file name, `Peek at
+14:22:31 - not saved`, or `Sweep building - 3 of 6 runs`.
 
 **follow new captures** is ticked by default, so a grab, a peek or a sweep step
 replaces what is on screen. During a sweep that means the combined plot as it
 builds, not each segment on its own - see [What it will
-cost](#what-it-will-cost) below. Untick it to hold a zoomed view while a sweep
-or an auto-grab runs. While following, a new capture resets the view -
-including the toolbar's history, since going Home to the previous capture's
-limits would mean nothing.
+cost](#what-it-will-cost) below. A capture arriving while you are zoomed is
+drawn into the view you have (that is the panel's hold); the toolbar's Back
+history starts over with it, since going back to the previous capture's limits
+would mean nothing. Untick the box to freeze the plot itself while a sweep or an
+auto-grab runs: captures still happen and are saved, the newest is kept back,
+and ticking the box again shows it.
 
-The window needs matplotlib's Tk backend. A Python that has matplotlib but not
-that still saves plots and shows the preview; the button just says so.
+`labplot.py` has to sit beside `spectrum_grab.py`, like `sr760.py`. Without it
+the PNGs are still written and the panel says what is missing; without
+matplotlib there is neither, and the CSV and metadata are still written.
 
 ## Two files
 
@@ -68,7 +77,7 @@ with SR760() as an:                    # or SR760(connect=False) then .connect()
 ```
 
 `sr760.py` imports numpy and pyvisa and nothing else - no tkinter, no
-matplotlib, no pillow - so the headless protocol runner in Trek-EOM-ILC can
+matplotlib, no labplot - so the headless protocol runner in Trek-EOM-ILC can
 import it on the bare system interpreter. The class is `SR760`, with
 `Analyzer = SR760` kept as an alias so older imports keep working.
 
@@ -170,14 +179,14 @@ The capture path calls `refresh_status()` exactly once, straight after
 - NI-488.2 (or any VISA with GPIB support). Check in NI MAX that the analyzer
   shows up, e.g. as `GPIB0::10::INSTR`.
 - Python 3.9+
-- `pip install pyvisa numpy matplotlib pillow`
-- `sr760.py` beside `spectrum_grab.py` - the panel imports the instrument
-  layer from it. Scripts need only that file, numpy and pyvisa.
+- `pip install pyvisa numpy matplotlib`
+- `sr760.py` and `labplot.py` beside `spectrum_grab.py` - the panel imports
+  the instrument layer from the one and the plot panel from the other. Scripts
+  need only `sr760.py`, numpy and pyvisa.
 
-matplotlib and pillow are both optional in the sense that the app starts and
-captures without them: without matplotlib there are no plots and no preview
-(the CSV and metadata are still written), and without pillow the preview falls
-back to Tk's integer subsample. The log says so at startup when matplotlib is
+matplotlib is optional in the sense that the app starts and captures without
+it: there are then no plots, on screen or on disk (the CSV and metadata are
+still written). The log says so at startup when matplotlib is
 missing - which happens when the app is launched with a Python that does not
 have it, e.g. the bare python.org install rather than the Anaconda one the bench
 scripts run under.
@@ -196,7 +205,9 @@ GPIB resource instead and take the first one that identifies as an SR760.
   `YYYYMMDD` the way the scripts built the date into `PATHNAME`.
 - **Title** - the front of every file name. Characters illegal in file names
   are replaced with `_`.
-- **csv / plot / metadata** - which of the three files each grab writes.
+- **csv / png / metadata** - which of the three files each grab writes. The
+  box is **png**, not plot: it gates the file and nothing else - the panel is
+  drawn whether or not it is ticked.
 - **Space** grabs, except while the focus is in a text field or on a control
   that uses the space bar itself, so typing a space in the title box does not
   fire an acquisition.
@@ -213,11 +224,11 @@ GPIB resource instead and take the first one that identifies as an SR760.
   the app just sends `STRT` and hands the GUI straight back. The averaging mode
   is asked of the analyzer each time, since it is one knob turn away on the
   front panel.
-- **Peek (saves nothing)** - reads the trace as it stands and plots it in the
-  preview box, writing nothing. It does not restart, range or settle, so an
-  average part way through is left exactly as it was and can be looked at again
-  as it builds. The frame says `not saved` and double-click does nothing, so a
-  peek can never be mistaken for a capture. Peak amplitude and its frequency go
+- **Peek (saves nothing)** - reads the trace as it stands and draws it on the
+  panel, writing nothing. It does not restart, range or settle, so an average
+  part way through is left exactly as it was and can be looked at again as it
+  builds. The caption says `not saved` and **Open PNG** is greyed, so a peek
+  can never be mistaken for a capture. Peak amplitude and its frequency go
   in the log.
 - **Auto-grab** - repeat on a fixed interval.
 - **Stop** - ends a sweep after the step in progress and releases the front
@@ -560,23 +571,25 @@ on, there is no estimate rather than a made-up one.
 
 ### Watching it build
 
-The preview and the zoom window show the combined plot **as it builds**, a trace
-at a time, rather than flashing through each segment on its own and assembling
-the picture only at the end. Waiting until the last run to find out that segment
+The panel shows the combined plot **as it builds**, a trace at a time, rather
+than flashing through each segment on its own and assembling the picture only
+at the end. Waiting until the last run to find out that segment
 three is sitting on the wrong range, or that the overlaps are not joining, is a
 long wait when a run is two minutes.
 
 It is drawn through the same code and in the same colours as the PNG written at
 the end, so nothing shifts when the sweep finishes - only the title note, from
 `(sweep building)` to `(sweep)`, and the `3 of 6 runs so far` under it. The
-frame above the preview says `Sweep building - 3 of 6 runs` while it goes, and
-double-clicking does nothing until there is a file: the combined PNG is written
+caption above the figure says `Sweep building - 3 of 6 runs` while it goes, and
+**Open PNG** stays greyed until there is a file: the combined PNG is written
 once, when the sweep ends.
 
-Each run's own CSV, plot and metadata are still written as they always were.
-The change is only which of them the window is showing. Untick **combined
-plot** and the window goes back to showing each segment as it lands, and a
-single grab is unaffected. The redraw is throttled to once every couple of
+No per-run files are written on the way - a sweep leaves [one set of
+files](#one-set-of-files-not-one-per-segment) unless **keep per-segment
+files** is ticked, and even then the window shows the combined picture, not
+each segment as it lands. **combined plot** decides only whether the combined
+PNG is saved at the end; unticked, you still watch it build. A single grab is
+unaffected either way. The redraw is throttled to once every couple of
 seconds, because every trace so far is redrawn each time and a long sweep of
 short runs would otherwise spend its time drawing rather than measuring.
 
@@ -593,7 +606,8 @@ difference is that it says so rather than passing itself off as complete:
   stay `NaN`, so the indices still line up with the axis values in the JSON and
   nothing reads as a measurement of zero;
 - `runs_planned`, `runs_completed` and `ended_early` go in the JSON;
-- the plot title carries the shortfall, e.g. `(stopped after 3 of 8)`.
+- the plot's settings line carries the shortfall, e.g. `3 of 8 runs - stopped`
+  (`- failed` when an instrument error ended it); the title stays `(sweep)`.
 
 A sweep that dies on an instrument error is written up the same way, so a fault
 on the last segment does not cost you the earlier ones.

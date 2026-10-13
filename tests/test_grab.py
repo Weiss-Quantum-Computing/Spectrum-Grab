@@ -223,9 +223,9 @@ def build_app(snap=None, errs=0, ffts=0, outdir=None, extra=None):
     set afterwards."""
     outdir = outdir or TMP
     with open(sg.CONFIG_PATH, "w", encoding="utf-8") as fh:
-        # Written rather than set afterwards so that load_latest_preview, which
-        # __init__ calls, looks in the temp folder and not in the real one.
-        # json.dumps, not %r: a Python repr of a Windows path is not JSON, and
+        # Written rather than set afterwards so that everything __init__ reads
+        # from the config - the output folder first - is the temp one and not
+        # the real one. json.dumps, not %r: a Python repr of a Windows path is not JSON, and
         # load_config would quietly reject the file and leave the default
         # output folder - the user's real one - in place.
         cfg = {"outdir": outdir, "dated": False, "title": "sr760"}
@@ -801,9 +801,9 @@ def sweep_into(outdir, starts, combined=True, save_png=True, spans=None,
     """Run a sweep and record every time the window was handed a plot."""
     root, app = build_app(outdir=outdir)
     shown = []
-    app.show_building = lambda data, done, planned: shown.append(
+    app.show_building = lambda done, planned: shown.append(
         ("building", done, planned))
-    app.show_preview = lambda path: shown.append(("saved", path, None))
+    app.show_saved = lambda path: shown.append(("saved", path, None))
     app.save_csv.set(False), app.save_txt.set(False), app.save_npy.set(False)
     app.save_png.set(save_png), app.combined.set(combined)
     app.lock.set(False), app.pause_cases.set(False)
@@ -838,7 +838,7 @@ ok("no single-segment plot steals the window on the way",
 ok("the finished combined plot is what is left on screen",
    shown[-1][0] == "saved" and shown[-1][1].endswith(".png"),
    str(shown[-1][:2]))
-ok("the zoom window has every trace to redraw from", len(plot[0]) == 4,
+ok("the panel has every trace to redraw from", len(plot[0]) == 4,
    f"{len(plot[0])} traces")
 
 # A sweep leaves one plot behind, not one per segment.
@@ -1095,6 +1095,151 @@ ok("nothing to draw yet draws nothing",
    not app.show_sweep_so_far([], 2, "dBV", "linear", force=True))
 root.destroy()
 
+# ---------------------------------------------- 9c. the embedded plot panel
+
+print("\n--- the plot is on the panel, not in a window of its own ---")
+
+import labplot                                       # noqa: E402
+
+# Was: an Agg PNG scaled into a 440x330 Label, and a separate zoom window
+# that lost its view on every redraw. Now the one figure every lab GUI has.
+root, app = build_app()
+ok("the panel is the lab's", isinstance(app.panel, labplot.PlotPanel))
+ok("the process draws in the lab style, not at the PNG's 14 pt",
+   sg.matplotlib.rcParams["font.size"] == labplot.FONT_SIZE,
+   str(sg.matplotlib.rcParams["font.size"]))
+ok("... and the PNG keeps its 14 pt, with the sizes relative to it",
+   sg.PNG_RC["font.size"] == 14 and sg.PNG_RC["axes.titlesize"] == "large",
+   str(sg.PNG_RC))
+ok("before a capture the panel says so",
+   app.panel.fig.axes == []
+   and any("no capture yet" in t.get_text() for t in app.panel.fig.texts))
+ok("the zoom window and the PIL preview are gone",
+   not any(hasattr(app, n) for n in ("open_zoom", "draw_zoom", "close_zoom",
+                                     "render_preview", "load_latest_preview"))
+   and not any(hasattr(sg, n) for n in ("PREVIEW_W", "PREVIEW_H", "PEEK_DPI",
+                                        "Image")))
+ok("follow new captures is on by default", app.follow.get())
+ok("Open PNG has nothing to open yet",
+   str(app.open_btn["state"]) == "disabled")
+
+
+def lines_on(panel):
+    """Traces per axes on the panel's figure."""
+    return [len(ax.get_lines()) for ax in panel.fig.axes]
+
+
+out = os.path.join(TMP, "panel")
+os.makedirs(out, exist_ok=True)
+app.outdir.set(out)
+app.dated.set(False)
+app.save_csv.set(False), app.save_txt.set(False), app.save_npy.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+app._grab_runs(["dark"], [None], [11])
+root.update()
+ok("after a grab the panel draws the capture", lines_on(app.panel) == [1],
+   str(lines_on(app.panel)))
+ok("... from last_plot, through draw_traces",
+   app.shown_plot is app.last_plot
+   and app.panel.fig.axes[0].get_title().startswith("sr760 - dark"),
+   app.panel.fig.axes[0].get_title())
+ok("... at the panel's sizes, not the PNG's",
+   app.panel.fig.axes[0].title.get_fontsize() == labplot.FONT_SIZE)
+ok("the caption names the file",
+   app.shot_caption.cget("text").endswith(".png"),
+   app.shot_caption.cget("text"))
+ok("... and Open PNG points at it",
+   str(app.open_btn["state"]) == "normal" and app.last_png.endswith(".png")
+   and os.path.exists(app.last_png))
+ok("Save proposes the title and the case", app.panel.proposed_name()
+   == "sr760_dark", app.panel.proposed_name())
+ok("... in the output folder", app.panel.proposed_dir() == out)
+
+# A peek holds a plot that is not a file.
+app.remember_plot([(np.arange(3.0), np.full(3, -90.0), "peek")],
+                  app.plot_title(note="peek"), "", "dBV", "linear")
+app.show_peek()
+root.update()
+ok("a peek is on the panel", "(peek)" in app.panel.fig.axes[0].get_title())
+ok("... captioned as not saved",
+   app.shot_caption.cget("text").startswith("Peek at")
+   and app.shot_caption.cget("text").endswith("- not saved"))
+ok("... with nothing for Open PNG to open",
+   app.last_png is None and str(app.open_btn["state"]) == "disabled")
+ok("Save then proposes a plain stem",
+   app.panel.proposed_name() == "sr760_spectrum", app.panel.proposed_name())
+
+# Follow off: what arrives is kept back, not drawn and not lost.
+app.follow.set(False)
+app.follow_changed()
+caption = app.shot_caption.cget("text")
+was, sg.PROGRESS_MIN_S = sg.PROGRESS_MIN_S, 0.0
+try:
+    app._grab_runs([""], [0.0, 1.0], [11])
+    root.update()
+finally:
+    sg.PROGRESS_MIN_S = was
+ok("with follow off a new capture leaves the panel alone",
+   lines_on(app.panel) == [1] and "(peek)" in app.panel.fig.axes[0].get_title(),
+   str(lines_on(app.panel)))
+ok("... and the caption", app.shot_caption.cget("text") == caption)
+ok("... while last_plot has moved on", len(app.last_plot[0]) == 2)
+ok("... and the panel knows something is waiting", app.waiting)
+app.panel.home()
+ok("Home redraws the held plot, not the new one",
+   lines_on(app.panel) == [1] and "(peek)" in app.panel.fig.axes[0].get_title())
+app.follow.set(True)
+app.follow_changed()
+ok("ticking follow shows what was waiting", lines_on(app.panel) == [2],
+   str(lines_on(app.panel)))
+ok("... the finished sweep, captioned by its file",
+   "_sweep_" in app.shot_caption.cget("text"), app.shot_caption.cget("text"))
+ok("... and nothing is left waiting", not app.waiting and not app.panel.dirty)
+
+# The view is held across a new capture once zoomed, and Home lets go.
+ax = app.panel.fig.axes[0]
+full = ax.get_xlim()
+app.panel.zoom_at(ax, 100.0, -80.0, 0.5)
+zoomed = ax.get_xlim()
+ok("the wheel zooms in about the cursor",
+   zoomed[1] - zoomed[0] < 0.6 * (full[1] - full[0]) and app.panel.view_locked,
+   f"{full} -> {zoomed}")
+app._grab_runs(["light"], [None], [11])
+root.update()
+ax = app.panel.fig.axes[0]
+ok("a new capture is drawn into the zoomed view",
+   lines_on(app.panel) == [1] and ax.get_xlim() == zoomed,
+   f"{ax.get_xlim()} vs {zoomed}")
+ok("... and the panel says so",
+   "Home" in app.panel.view_note.cget("text"), app.panel.view_note.cget("text"))
+app.panel.home()
+ax = app.panel.fig.axes[0]
+ok("Home releases it", not app.panel.view_locked and ax.get_xlim() != zoomed
+   and app.panel.view_note.cget("text") == "", str(ax.get_xlim()))
+
+# Save goes through the panel: 150 dpi by labplot, in the session's folder.
+path = os.path.join(out, "from_the_panel.png")
+ok("save_figure writes the file",
+   app.panel.save_figure(path) == path and os.path.getsize(path) > 1000)
+ok("... and the log says where", f"saved figure: {path}" in logged(app))
+
+
+def png_size(p):
+    """Width and height from the PNG header."""
+    with open(p, "rb") as fh:
+        head = fh.read(24)
+    return (int.from_bytes(head[16:20], "big"),
+            int.from_bytes(head[20:24], "big"))
+
+
+fw, fh = app.panel.fig.get_size_inches()
+ok("... at labplot's 150 dpi on the panel's figure",
+   png_size(path) == (round(fw * 150), round(fh * 150)),
+   f"{png_size(path)} for {fw:.2f}x{fh:.2f} in")
+ok("... while the capture's own PNG is still 8x6 in at 300 dpi",
+   png_size(app.last_png) == (2400, 1800), str(png_size(app.last_png)))
+root.destroy()
+
 # ------------------------------------------ 10. comparing saved sequences
 
 print("\n--- reading the units back off disk ---")
@@ -1280,7 +1425,7 @@ os.makedirs(cmp_out, exist_ok=True)
 app.outdir.set(cmp_out)
 app.dated.set(False)
 shown = []
-app.show_preview = lambda p: shown.append(p)
+app.show_saved = lambda p: shown.append(p)
 app.do_compare_plot()
 root.update()
 made = [n for n in os.listdir(cmp_out) if n.endswith(".png")]
@@ -1767,8 +1912,8 @@ ok("Stage preset and its dropdown are gone",
    not hasattr(app, "preset") and not hasattr(app, "do_defaults"))
 ok("... but the library still has the presets for the protocol runner",
    "protocol" in S.PRESETS and "legacy" in S.PRESETS)
-# The box gates write_plot and nothing else - the preview and the zoom window
-# are drawn whether or not it is ticked - so it is named for what it writes.
+# The box gates write_plot and nothing else - the panel is drawn whether or not
+# it is ticked - so it is named for what it writes.
 def labels(widget, out=None):
     """Every checkbutton label in the panel, wherever it is nested."""
     out = [] if out is None else out

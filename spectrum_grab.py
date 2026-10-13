@@ -10,22 +10,22 @@ sweeps, the fast SPEB? binary transfer and the autorange-then-freeze routine.
 The instrument itself lives in sr760.py beside this file, which is also the
 scripting library: one copy of the command ordering, the settings model and the
 file format, shared with the headless protocol runner. This file is the panel -
-Tk, matplotlib and the config file, and nothing else.
+Tk, matplotlib and the config file, and nothing else. The live plot is the
+lab's shared plot panel, labplot.py, vendored beside this file.
 
 Requires: NI-488.2 (or any VISA with GPIB support) + `pip install pyvisa numpy
-          matplotlib pillow`
-          (matplotlib draws the plots, pillow only sharpens the preview - the
-          CSV and the metadata file are written without either)
+          matplotlib`
+          (matplotlib draws the plots and the panel's figure - the CSV and the
+          metadata file are written without it)
 Run with:  pythonw spectrum_grab.py      (pythonw = no console window)
 """
 
-import base64
 import datetime
-import io
 import json
 import os
 import queue
 import re
+import sys
 import textwrap
 import threading
 import time
@@ -59,30 +59,40 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    write_csv)
 
 try:
-    from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
-except ImportError:                       # without pillow: Tk's integer subsample
-    Image = ImageTk = None
-
-try:
     import matplotlib
     matplotlib.use("Agg")                  # plots are files, not pop-up windows, so
-    matplotlib.rcParams["font.size"] = 14  # they can be drawn off the main thread
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg   # they can be
+    from matplotlib.figure import Figure   # drawn off the main thread
 except ImportError:                       # everything but the plots still works
-    Figure = None
+    matplotlib = Figure = None
 
-# The zoom window is the one plot that is not a file: a live Tk canvas with
-# matplotlib's own navigation toolbar behind it. Imported separately because the
-# Agg backend above is what lets the saved plots be drawn off the main thread,
-# and that has to go on being true - this canvas is touched by the main thread
-# only. A Python with matplotlib but no Tk backend still saves plots; it just
-# cannot zoom.
+# The one plot that is not a file is the panel's figure: labplot.PlotPanel, the
+# plot panel every lab GUI embeds, vendored beside this file from
+# Weiss-Quantum-Computing/lab-plot. Found by path like sr760.py, and optional:
+# without the copy the program still captures and saves, it just has no live
+# plot. Its Tk canvas is touched by the main thread only, which is what lets the
+# Agg backend above go on drawing the saved PNGs off it.
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 try:
-    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
-                                                   NavigationToolbar2Tk)
+    import labplot
 except ImportError:
-    FigureCanvasTkAgg = NavigationToolbar2Tk = None
+    labplot = None
+
+# The saved PNG keeps the look it has always had - 14 pt, every other size
+# relative to it - while the panel draws in the lab's 8 pt style. The PNG's rc
+# values are captured before apply_style() runs, so none of the panel's absolute
+# sizes can leak into a file; save_plot draws inside rc_context(PNG_RC).
+PNG_RC = {}
+if matplotlib is not None:
+    PNG_RC = {k: matplotlib.rcParams[k] for k in (
+        "font.size", "axes.titlesize", "axes.labelsize", "xtick.labelsize",
+        "ytick.labelsize", "legend.fontsize", "grid.alpha", "savefig.dpi",
+        "axes.formatter.useoffset", "axes.formatter.use_mathtext")}
+    PNG_RC["font.size"] = 14
+if labplot is not None:
+    labplot.apply_style()
 
 # Remembered between sessions: folder, title, sweep lists, acquisition options.
 # Kept out of the program folder so a git pull cannot clobber it.
@@ -90,8 +100,13 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                            "SpectrumGrab", "config.json")
 
 PLOT_DPI = 300
-PEEK_DPI = 110                # a peek is only ever looked at in the preview box
-PREVIEW_W, PREVIEW_H = 440, 330
+PANEL_FIGSIZE = (6.0, 4.2)    # the embedded figure; it grows with the window
+# The text sizes draw_traces uses, in points. The PNG's are what it has always
+# drawn at 14 pt; the panel's are the lab style, which reads at 8 pt.
+PNG_FONTS = {"title": 15, "notes": 9, "legend": 9}
+PANEL_FONTS = ({"title": labplot.FONT_SIZE, "notes": labplot.NOTE_SIZE,
+                "legend": labplot.LEGEND_SIZE} if labplot is not None
+               else {"title": 8, "notes": 6.5, "legend": 7})
 
 # How often the combined plot may be redrawn while a sweep builds it up. At the
 # span a segmented measurement is actually taken on a run is a minute or more,
@@ -126,7 +141,7 @@ DEFAULT_YMIN, DEFAULT_YMAX = -160.0, -20.0
 # sizes a widget to fit its label and passes the request up to the window. A
 # capture's file name is sixty characters and used to move the whole panel 91 px
 # wider every time a grab finished, then back again on the next peek.
-CAPTION_CHARS = 58            # under the preview
+CAPTION_CHARS = 58            # above the plot
 STATUS_CHARS = 64             # the connection, hold and compare lines
 MIN_W, MIN_H = 900, 700       # a floor for fit_window on a small screen
 AVG_BOX_W, AVG_BOX_H = 215, 34   # the what-the-averaging-is-worth read-out,
@@ -253,7 +268,7 @@ def load_sequences(paths, log=None):
 
 
 def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
-                yscale="linear", refs=()):
+                yscale="linear", refs=(), fonts=None):
     """Draw one or more traces onto an existing axes.
 
     Titling is two lines: what the capture is, then the handful of settings that
@@ -268,9 +283,13 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
     no reference. They count toward the y window like anything else, because a
     comparison whose reference falls off the top of the plot is not one.
 
-    Split out from save_plot so the zoom window draws through the same code: a
-    plot you have zoomed into and the PNG on disk should differ in nothing but
-    the axis limits."""
+    Split out from save_plot so the panel draws through the same code: a plot
+    you have zoomed into and the PNG on disk should differ in nothing but the
+    axis limits and the point size. `fonts` is the title/notes/legend sizes -
+    PNG_FONTS, the 14 pt file, unless the caller is the 8 pt panel - and the
+    wrap widths follow them, so a title that fits across the file in two lines
+    is not folded into four on the screen."""
+    fonts = PNG_FONTS if fonts is None else fonts
     for i, (freqs, amps, label) in enumerate(refs):
         ax.plot(freqs, amps, lw=1.0, label=label, zorder=1,
                 color=REF_GREYS[i % len(REF_GREYS)])
@@ -299,41 +318,58 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
         if everything and min(float(np.nanmin(a))
                               for _, a, _ in everything) > 0:
             ax.set_yscale("log")
-            ax.grid(True, which="minor", alpha=0.3)
         else:
             notes.append("linear y-scale: the trace reaches zero")
-    notes = wrap_notes(notes)
+    # Characters per line scale with the point size: TITLE_WRAP and
+    # SUBTITLE_WRAP were measured at the PNG's sizes.
+    notes = wrap_notes(notes, round(SUBTITLE_WRAP * PNG_FONTS["notes"]
+                                    / fonts["notes"]))
 
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel(pretty_units(ylabel))
+    if labplot is not None:
+        # Labels and the lab grid (30 %, minor lines too on a log axis).
+        labplot.finish(ax, "Frequency (Hz)", pretty_units(ylabel))
+    else:
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel(pretty_units(ylabel))
+        ax.grid(True, which="both" if ax.get_yscale() == "log" else "major")
     # The title is the name of the capture and nothing else, so a folder of
     # plots can be told apart at a glance; the settings that used to swamp it -
     # and the mangled file name it used to be - go in a smaller line beneath.
     # The room the notes need is reserved with the title's pad, because
-    # tight_layout only measures the title itself.
-    ax.set_title(textwrap.fill(title, TITLE_WRAP), fontsize=15,
-                 pad=(8 + 13 * (notes.count("\n") + 1)) if notes else 8)
+    # tight_layout only measures the title itself. 13 pt a line at 9 pt with
+    # linespacing 1.4, scaled with the notes size.
+    line_h = round(fonts["notes"] * 13 / 9)
+    ax.set_title(textwrap.fill(title, round(TITLE_WRAP * PNG_FONTS["title"]
+                                            / fonts["title"])),
+                 fontsize=fonts["title"],
+                 pad=(8 + line_h * (notes.count("\n") + 1)) if notes else 8)
     if notes:
         ax.text(0.5, 1.008, notes, transform=ax.transAxes, ha="center",
-                va="bottom", fontsize=9, color="#444", linespacing=1.4)
-    ax.grid(True)
+                va="bottom", fontsize=fonts["notes"], color="#444",
+                linespacing=1.4)
     # A reference always earns a legend entry - unlabelled grey is just clutter
     # - so one trace against one reference is a legend where one trace alone
-    # is not.
-    if legend and 1 < len(everything) <= 12:
-        ax.legend(fontsize=9)
+    # is not. Above twelve entries there is no legend (labplot's rule, and this
+    # file's before it): it would hide more than it tells.
+    if legend and len(everything) > 1:
+        if labplot is not None:
+            labplot.legend(ax, n=len(everything), fontsize=fonts["legend"])
+        elif len(everything) <= 12:
+            ax.legend(fontsize=fonts["legend"])
 
 
 def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
               dpi=PLOT_DPI, yscale="linear", refs=()):
-    """The same plot as a PNG. `path` may be a file object, which is how the
-    peek keeps its picture out of the file system."""
-    fig = Figure(figsize=(8, 6))
-    FigureCanvasAgg(fig)
-    draw_traces(fig.add_subplot(111), traces, title, subtitle, ylabel,
-                ymin, ymax, legend, yscale, refs=refs)
-    fig.tight_layout()
-    fig.savefig(path, format="png", dpi=dpi)
+    """The same plot as a PNG: 8x6 in, 14 pt, tight_layout, 300 dpi. `path` may
+    be a file object. Drawn inside rc_context(PNG_RC) so the file looks as it
+    always has whatever style the panel has put in rcParams."""
+    with matplotlib.rc_context(PNG_RC):
+        fig = Figure(figsize=(8, 6))
+        FigureCanvasAgg(fig)
+        draw_traces(fig.add_subplot(111), traces, title, subtitle, ylabel,
+                    ymin, ymax, legend, yscale, refs=refs)
+        fig.tight_layout()
+        fig.savefig(path, format="png", dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +387,18 @@ class App:
         self.busy = False
         self.abort = threading.Event()
         self.auto_job = None
-        # What was drawn last, kept so the zoom window can redraw it from the
-        # data rather than from the PNG: (traces, title, subtitle, ylabel,
-        # yscale). None until the first grab or peek of the session.
+        # What was drawn last, kept so the panel can redraw it from the data
+        # rather than from the PNG: (traces, title, subtitle, ylabel, yscale,
+        # refs). None until the first grab or peek of the session. shown_plot
+        # is the one the panel is actually drawing, which lags behind while
+        # "follow new captures" is unticked; pending is the newest arrival,
+        # with its caption and file, waiting for the box to be ticked again.
         self.last_plot = None
+        self.last_case = ""
+        self.shown_plot = None
+        self.shown_case = ""
+        self.pending = None
+        self.waiting = False
         # When the building sweep was last redrawn, so a long sweep of short
         # runs does not spend its time drawing instead of measuring.
         self.last_progress = 0.0
@@ -365,8 +409,6 @@ class App:
         # repeating on every redraw.
         self.compare = []
         self.said = set()
-        self.zoom_win = self.zoom_fig = self.zoom_ax = None
-        self.zoom_canvas = self.zoom_tb = None
         # Range hold: the input range a measurement set is pinned to, and when
         # it was armed. None means no set is being held. It deliberately
         # outlives one press of GRAB - dark against light, or resistor against
@@ -394,7 +436,7 @@ class App:
         self.build_hold(left, pad)
         self.build_compare(left, pad)
         self.build_log(left, pad)
-        self.build_preview(right, pad)
+        self.build_plot(right, pad)
         self.build_settings(right, pad)
 
         root.bind("<space>", self.on_space)
@@ -403,13 +445,15 @@ class App:
         self.saved_cfg = None
         if Figure is None:
             self.log("matplotlib is not installed for this Python, so there are "
-                     "no plots and no preview.")
+                     "no plots, on screen or on disk.")
             self.log("  CSV and metadata are unaffected. To get plots: "
                      "pip install matplotlib")
+        elif labplot is None:
+            self.log("labplot.py is missing from the program folder, so there "
+                     "is no plot panel. PNGs are still written.")
         self.load_config()
         self.root.after(100, self.pump)
         self.root.after(300, self.do_connect)
-        self.load_latest_preview()
 
     def fit_window(self):
         """Size the window to what the panel actually asks for, capped by the
@@ -468,8 +512,8 @@ class App:
         row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=(2, 6))
         self.dated = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="dated subfolder", variable=self.dated,
-                        command=self.load_latest_preview).pack(side="left")
+        ttk.Checkbutton(row, text="dated subfolder",
+                        variable=self.dated).pack(side="left")
         self.save_csv = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="csv", variable=self.save_csv).pack(side="left",
                                                                      padx=8)
@@ -709,40 +753,57 @@ class App:
         self.logbox = tk.Text(f, height=8, wrap="none", font=("Consolas", 9))
         self.logbox.pack(fill="both", expand=True, padx=4, pady=4)
 
-    def build_preview(self, parent, pad):
+    def build_plot(self, parent, pad):
         # The frame's own label never changes. A LabelFrame asks for room to
         # draw its label, and that request goes all the way up to the window, so
         # a caption there is a caption that resizes the panel: "Last plot -
-        # <name>.png (double-click...)" is a hundred characters and moved
-        # everything 91 px sideways at the end of every grab.
+        # <name>.png" is a hundred characters and moved everything 91 px
+        # sideways at the end of every grab.
         self.shot_frame = ttk.LabelFrame(parent, text="Last plot")
-        self.shot_frame.pack(fill="x", **pad)
-        box = tk.Frame(self.shot_frame, width=PREVIEW_W, height=PREVIEW_H)
-        box.pack(padx=4, pady=4)
-        box.pack_propagate(False)     # keep the box from shrinking to the label
-        self.preview = ttk.Label(box, text="(no plot yet)", anchor="center")
-        self.preview.pack(fill="both", expand=True)
-        self.preview.bind("<Double-Button-1>", self.open_preview)
-        self.preview_img = None
-        self.preview_path = None
+        self.shot_frame.pack(fill="both", expand=True, **pad)
+        self.last_png = None
+        if labplot is None:
+            self.panel = None
+            ttk.Label(self.shot_frame, foreground="#c60", anchor="center",
+                      text="labplot.py is missing from the program folder - "
+                           "no plot panel").pack(fill="both", expand=True,
+                                                 padx=4, pady=4)
+            top = ttk.Frame(self.shot_frame)
+            top.pack(side="top", fill="x")
+        else:
+            # The lab's panel: toolbar, view held across redraws once zoomed,
+            # wheel zoom, right-click copy, Save - all its own. Save proposes
+            # <title>_<case>.png in the session's folder.
+            self.panel = labplot.PlotPanel(
+                self.shot_frame, draw=self.draw_panel, figsize=PANEL_FIGSIZE,
+                save_name=self.plot_stem, save_dir=self.target_dir,
+                on_status=self.log)
+            self.panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+            top = self.panel.controls
 
-        # The caption lives here instead, in a box of its own that cannot grow:
+        row = ttk.Frame(top)
+        row.pack(fill="x", padx=2, pady=(2, 0))
+        # Following, a grab, a peek or a sweep step replaces what is on screen;
+        # unticked, the plot stays put until the box is ticked again. This is
+        # not the panel's hold-view, which keeps the axis limits and still
+        # redraws the data.
+        self.follow = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="follow new captures", variable=self.follow,
+                        command=self.follow_changed).pack(side="left")
+        self.open_btn = ttk.Button(row, text="Open PNG", command=self.open_png,
+                                   state="disabled")
+        self.open_btn.pack(side="right")
+
+        # The caption lives in a box of its own that cannot grow:
         # pack_propagate(False) means whatever is written in it asks for nothing.
-        cap = tk.Frame(self.shot_frame, width=PREVIEW_W, height=20)
-        cap.pack(fill="x", padx=6)
+        cap = tk.Frame(top, width=200, height=20)
+        cap.pack(fill="x", padx=2)
         cap.pack_propagate(False)
         self.shot_caption = ttk.Label(cap, text="(no plot yet)", anchor="w",
                                       foreground="#444")
         self.shot_caption.pack(fill="both", expand=True)
-
-        row = ttk.Frame(self.shot_frame)
-        row.pack(fill="x", padx=6, pady=(0, 6))
-        self.zoom_btn = ttk.Button(row, text="Zoom / pan...",
-                                   command=self.open_zoom, state="disabled")
-        self.zoom_btn.pack(side="left")
-        self.zoom_follow = tk.BooleanVar(value=True)
-        ttk.Label(row, text="double-click the plot for the saved PNG",
-                  foreground="#666").pack(side="left", padx=8)
+        if self.panel is not None:
+            self.panel.draw()                    # the "no capture yet" placeholder
 
     def build_settings(self, parent, pad):
         self.set_vars = {}        # key -> StringVar shown in the panel
@@ -841,7 +902,6 @@ class App:
         d = filedialog.askdirectory(initialdir=self.outdir.get() or ".")
         if d:
             self.outdir.set(d)
-            self.load_latest_preview()
             self.save_config()
 
     def safe_title(self):
@@ -892,175 +952,113 @@ class App:
         answered.wait()
         return box.get("go", False)
 
-    # -- preview ----------------------------------------------------------
-
-    def render_preview(self, source):
-        """Put a PNG in the preview box: `source` is a file path, or PNG bytes
-        for a plot that was never written to disk. Main thread only (Tk images
-        are not thread safe)."""
-        try:
-            if Image is not None:
-                im = Image.open(source if isinstance(source, str)
-                                else io.BytesIO(source))
-                im.load()
-                k = min(PREVIEW_W / im.width, PREVIEW_H / im.height, 1.0)
-                if k < 1.0:
-                    im = im.resize((max(1, round(im.width * k)),
-                                    max(1, round(im.height * k))),
-                                   Image.LANCZOS)
-                img = ImageTk.PhotoImage(im)
-            else:
-                # Tk 8.6 reads PNG natively, from a file or from base64 data.
-                img = (tk.PhotoImage(file=source) if isinstance(source, str)
-                       else tk.PhotoImage(data=base64.b64encode(source)))
-                k = 1
-                while img.width() // k > PREVIEW_W or img.height() // k > PREVIEW_H:
-                    k += 1
-                if k > 1:
-                    img = img.subsample(k)         # integer factors only
-        except Exception as exc:
-            self.log(f"  (preview failed: {exc})")
-            return False
-        self.preview_img = img            # keep a reference or Tk drops it
-        self.preview.configure(image=img, text="")
-        return True
+    # -- the plot ---------------------------------------------------------
+    #
+    # One figure, embedded, the same panel every lab GUI has: the toolbar, the
+    # view held across a redraw once zoomed, wheel zoom, right-click copy and
+    # Save all come from labplot.PlotPanel. What this file adds is what goes on
+    # it - the last plot, through the same drawing code the PNG goes through -
+    # and when: a new capture replaces it while "follow new captures" is
+    # ticked, and is kept back, not lost, while it is not.
 
     def set_caption(self, text):
-        """Main thread. What the preview is showing, in a label that cannot
+        """Main thread. What the panel is showing, in a label that cannot
         resize the panel around it."""
         self.shot_caption.configure(text=elide(text, CAPTION_CHARS))
 
-    def show_preview(self, path):
-        if not self.render_preview(path):
-            return
-        self.preview_path = path
-        self.set_caption(os.path.basename(path))
-
-    def show_peek(self, data):
-        """A plot held only in the window. preview_path goes to None: there is
-        no file to open, so a double-click must not reopen the last saved one
-        and pass it off as what is on screen."""
-        if not self.render_preview(data):
-            return
-        self.preview_path = None
-        stamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.set_caption(f"Peek at {stamp} - not saved")
-
-    def show_building(self, data, done, planned):
-        """The sweep as it stands, part way through. Same reasoning as the peek
-        about preview_path: the combined PNG is not written until the sweep
-        ends, so there is nothing for a double-click to open yet and it must not
-        fall back to whichever file happened to be shown before."""
-        if not self.render_preview(data):
-            return
-        self.preview_path = None
-        self.set_caption(f"Sweep building - {done} of {planned} runs")
-
-    # -- zoom window ------------------------------------------------------
-
-    def remember_plot(self, traces, title, subtitle, ylabel, yscale, refs=()):
-        """Keep what was just drawn so the zoom window can rebuild it from the
-        data. Called from the worker threads, so the window itself is only
-        touched by way of the main loop."""
+    def remember_plot(self, traces, title, subtitle, ylabel, yscale, refs=(),
+                      case=""):
+        """Keep what was just drawn so the panel can rebuild it from the data.
+        Any thread. The panel is not touched here: the show_* call that follows
+        says what the plot is and hands both over to the main loop together."""
         self.last_plot = (traces, title, subtitle, ylabel, yscale, refs)
-        self.root.after(0, self.plot_arrived)
+        self.last_case = case
 
-    def plot_arrived(self):
-        """Main thread. A new plot exists, so zooming is now possible; redraw an
-        open window if it is following."""
-        self.zoom_btn.configure(state="normal")
-        if self.zoom_follow.get():
-            self.draw_zoom()
+    def show_saved(self, path):
+        """The last plot is the file at `path`. Any thread."""
+        self.hand_over(os.path.basename(path), path)
 
-    def zoom_open(self):
-        return self.zoom_win is not None and self.zoom_win.winfo_exists()
+    def show_peek(self):
+        """A plot held only in the window. The PNG goes to None: there is no
+        file to open, so Open PNG must not reopen the last saved one and pass
+        it off as what is on screen."""
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.hand_over(f"Peek at {stamp} - not saved", None)
 
-    def open_zoom(self):
-        """An interactive copy of the last plot in a window of its own, with
-        matplotlib's navigation toolbar: rectangle zoom, pan, back, forward,
-        Home and Save, the same set the ILC panel has.
+    def show_building(self, done, planned):
+        """The sweep as it stands, part way through. Same reasoning as the peek
+        about the PNG: the combined one is not written until the sweep ends, so
+        there is nothing for Open PNG to open yet and it must not fall back to
+        whichever file happened to be shown before."""
+        self.hand_over(f"Sweep building - {done} of {planned} runs", None)
 
-        A window rather than the preview box, for two reasons. A spectrum is
-        worth looking at large, and the preview has to go on showing PNGs this
-        session did not draw - the newest file in the folder at startup has no
-        trace data behind it to redraw from."""
-        if Figure is None or FigureCanvasTkAgg is None:
-            self.log("Zoom needs matplotlib with its Tk backend, which this "
-                     "Python does not have.")
+    def hand_over(self, caption, png):
+        """Any thread. Bundle the last plot with what it is and send the bundle
+        to the main loop - together, so two captures arriving close to each
+        other cannot pair one's data with the other's caption."""
+        plot, case = self.last_plot, self.last_case
+        self.root.after(0, lambda: self.plot_arrived(plot, case, caption, png))
+
+    def plot_arrived(self, plot, case, caption, png):
+        """Main thread. A new plot exists. Following, the panel takes it now.
+        Not following, it waits until the box is ticked again, and the panel
+        goes on showing - and redrawing, on Home or a resize - the plot it had,
+        which is what holding a view through a sweep means."""
+        self.pending = (plot, case, caption, png)
+        self.waiting = True
+        if self.follow.get() or self.panel is None:
+            self.take_pending()     # no panel: the caption and Open PNG still work
+
+    def take_pending(self):
+        """Main thread. The waiting plot becomes the shown one. `waiting` is
+        this file's flag, not the panel's `dirty`: Home redraws the held plot
+        and clears `dirty` on the way, and the new capture would be forgotten."""
+        plot, case, caption, png = self.pending
+        self.waiting = False
+        self.shown_plot, self.shown_case = plot, case
+        self.last_png = png
+        self.set_caption(caption)
+        self.open_btn.configure(state="normal" if png else "disabled")
+        if self.panel is not None:
+            self.panel.mark_dirty()
+            self.panel.draw()
+
+    def follow_changed(self):
+        """The box was ticked or unticked. Ticked with a capture waiting, the
+        panel shows it; unticked, nothing happens until something arrives."""
+        if self.follow.get() and self.waiting:
+            self.take_pending()
+
+    def draw_panel(self, fig):
+        """Main thread, from the panel. The shown plot through the same code
+        the PNG goes through, at the panel's point sizes: what you zoom into
+        differs from the file on disk in nothing but the axis limits and the
+        size of the text."""
+        if self.shown_plot is None:
+            labplot.placeholder(fig, "no capture yet")
             return
-        if self.last_plot is None:
-            self.log("Nothing plotted yet - grab or peek first.")
-            return
-        if self.zoom_open():
-            self.zoom_win.deiconify()
-            self.zoom_win.lift()
-            self.draw_zoom()
-            return
-
-        win = tk.Toplevel(self.root)
-        win.title("Spectrum Grab - zoom")
-        win.geometry("980x720")
-        fig = Figure(figsize=(9, 6.4), dpi=100)
-        canvas = FigureCanvasTkAgg(fig, master=win)
-
-        # Anything of a fixed height has to be packed before the canvas: the
-        # canvas expands into whatever cavity is left when it is packed, and
-        # packing it first leaves the toolbar nothing to sit in.
-        bar = ttk.Frame(win)
-        bar.pack(side="bottom", fill="x")
-        ttk.Checkbutton(bar, text="follow new captures",
-                        variable=self.zoom_follow).pack(side="left", padx=6,
-                                                        pady=3)
-        ttk.Label(bar, text="untick to hold this view while a sweep or an "
-                            "auto-grab runs", foreground="#666").pack(
-            side="left", padx=4)
-        self.zoom_tb = NavigationToolbar2Tk(canvas, win)
-        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-
-        self.zoom_win, self.zoom_fig, self.zoom_canvas = win, fig, canvas
-        self.zoom_ax = fig.add_subplot(111)
-        win.protocol("WM_DELETE_WINDOW", self.close_zoom)
-        self.draw_zoom()
-
-    def close_zoom(self):
-        win, self.zoom_win = self.zoom_win, None
-        self.zoom_fig = self.zoom_ax = self.zoom_canvas = self.zoom_tb = None
-        if win is not None:
-            win.destroy()
-
-    def draw_zoom(self):
-        """Main thread. Redraw the zoom window from the last plot, through the
-        same drawing code the PNG goes through."""
-        if not self.zoom_open() or self.last_plot is None:
-            return
-        traces, title, subtitle, ylabel, yscale, refs = self.last_plot
-        self.zoom_ax.clear()
+        traces, title, subtitle, ylabel, yscale, refs = self.shown_plot
+        fig.clear()
+        ax = fig.add_subplot(111)
         try:
-            draw_traces(self.zoom_ax, traces, title, subtitle, ylabel,
-                        *self.y_window(ylabel), yscale=yscale, refs=refs)
-            self.zoom_fig.tight_layout()
-            self.zoom_canvas.draw_idle()
+            draw_traces(ax, traces, title, subtitle, ylabel,
+                        *self.y_window(ylabel), yscale=yscale, refs=refs,
+                        fonts=PANEL_FONTS)
         except Exception as exc:
-            self.log(f"  (zoom redraw failed: {exc})")
-            return
-        # The view stack belonged to the trace that has just been replaced, so
-        # Home would otherwise go back to the previous capture's limits.
-        self.zoom_tb.update()
+            self.log(f"  (plot redraw failed: {exc})")
+            labplot.placeholder(fig, "redraw failed - see the log")
 
-    def load_latest_preview(self):
-        outdir = self.target_dir()
-        try:
-            shots = [os.path.join(outdir, n) for n in os.listdir(outdir)
-                     if n.lower().endswith(".png")]
-        except OSError:
-            return
-        if shots:
-            self.show_preview(max(shots, key=os.path.getmtime))
+    def plot_stem(self):
+        """What Save on the toolbar proposes: <title>_<case>, or _spectrum when
+        the plot has no case (a plain grab, a peek, a sweep, a comparison)."""
+        return f"{self.safe_title()}_{safe_name(self.shown_case) or 'spectrum'}"
 
-    def open_preview(self, _event=None):
-        if self.preview_path:
+    def open_png(self):
+        """The last saved PNG in whatever opens PNGs. Disabled while what is on
+        screen is a peek or a building sweep, which have no file."""
+        if self.last_png:
             try:
-                os.startfile(self.preview_path)
+                os.startfile(self.last_png)
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
 
@@ -1768,10 +1766,11 @@ class App:
             if Figure is None:
                 self.log("  (no matplotlib: there is nothing to draw it with)")
                 return
-            png = self.plot_png(
-                [(freqs, amps, "peek")], self.plot_title(note="peek"),
-                self.plot_subtitle(snap, freqs), ylabel, trace_yscale(snap))
-            self.root.after(0, lambda d=png: self.show_peek(d))
+            self.remember_plot([(freqs, amps, "peek")],
+                               self.plot_title(note="peek"),
+                               self.plot_subtitle(snap, freqs), ylabel,
+                               trace_yscale(snap), self.refs_for(ylabel))
+            self.show_peek()
         except KeyboardInterrupt:
             self.log("Peek stopped part way through the readout - nothing shown.")
             self.an.recover()
@@ -2295,8 +2294,8 @@ class App:
         """CSV, plot and metadata for one measurement, under one shared base
         name so the three files of a capture always belong together.
 
-        `show=False` still writes all three; it only keeps this one trace out of
-        the preview, which during a sweep belongs to the combined plot."""
+        `show=False` still writes all three; it only keeps this one trace off
+        the panel, which during a sweep belongs to the combined plot."""
         code = code_of(snap, "SPAN")
         start = float(freqs[0])
         maxfreq = round(float(np.max(freqs)))
@@ -2341,7 +2340,7 @@ class App:
             self.write_plot(base + ".png", [(freqs, amps, stem)],
                             self.plot_title(case),
                             self.plot_subtitle(snap, freqs, notes), ylabel,
-                            trace_yscale(snap), show=show)
+                            trace_yscale(snap), show=show, case=case)
 
     # -- plots ------------------------------------------------------------
 
@@ -2400,23 +2399,12 @@ class App:
         return (self.float_of(self.ymin, DEFAULT_YMIN, "y min"),
                 self.float_of(self.ymax, DEFAULT_YMAX, "y max"))
 
-    def plot_png(self, traces, title, subtitle, ylabel, yscale="linear",
-                 refs=None):
-        """The same plot as a PNG in memory, for the peek. Drawn coarser than a
-        saved one: it is only ever seen scaled down into the preview box."""
-        refs = self.refs_for(ylabel) if refs is None else refs
-        buf = io.BytesIO()
-        save_plot(buf, traces, title, subtitle, ylabel, *self.y_window(ylabel),
-                  dpi=PEEK_DPI, yscale=yscale, refs=refs)
-        self.remember_plot(traces, title, subtitle, ylabel, yscale, refs)
-        return buf.getvalue()
-
     def write_plot(self, path, traces, title, subtitle, ylabel,
-                   yscale="linear", show=True, refs=None):
-        """`show=False` writes the file without taking over the preview and the
-        zoom window. That is what a sweep wants for its per-run plots: they are
-        still saved, but the window is showing the combined picture building up
-        and must not flicker through each segment on its own on the way."""
+                   yscale="linear", show=True, refs=None, case=""):
+        """`show=False` writes the file without taking over the panel. That is
+        what a sweep wants for its per-run plots: they are still saved, but the
+        window is showing the combined picture building up and must not flicker
+        through each segment on its own on the way."""
         if Figure is None:
             self.log("  (no matplotlib: skipping the plot)")
             return
@@ -2430,8 +2418,8 @@ class App:
         self.log(f"  {os.path.basename(path)}")
         if not show:
             return
-        self.remember_plot(traces, title, subtitle, ylabel, yscale, refs)
-        self.root.after(0, lambda p=path: self.show_preview(p))
+        self.remember_plot(traces, title, subtitle, ylabel, yscale, refs, case)
+        self.show_saved(path)
 
     def show_sweep_so_far(self, done, planned, ylabel, yscale, force=False):
         """Draw the sweep as far as it has got, into the window only.
@@ -2444,7 +2432,7 @@ class App:
         written at the end.
 
         Nothing is saved here - `save_sweep` still writes the file once, when
-        the sweep is over. Returns whether it drew.
+        the sweep is over. Returns whether it handed the panel a plot.
         """
         if Figure is None or not done:
             return False
@@ -2455,14 +2443,9 @@ class App:
         subtitle = SUBTITLE_SEP.join(
             [f"{len(done)} of {planned} runs so far",
              datetime.datetime.now().strftime("%Y-%m-%d %H:%M")])
-        try:
-            png = self.plot_png(done, self.plot_title(note="sweep building"),
-                                subtitle, ylabel, yscale)
-        except Exception as exc:
-            self.log(f"  (progress plot failed: {exc})")
-            return False
-        self.root.after(0, lambda d=png, n=len(done): self.show_building(
-            d, n, planned))
+        self.remember_plot(done, self.plot_title(note="sweep building"),
+                           subtitle, ylabel, yscale, self.refs_for(ylabel))
+        self.show_building(len(done), planned)
         return True
 
     @staticmethod
