@@ -53,7 +53,8 @@ from sr760 import (SR760, ALL_SETTINGS, BAD_NAME_CHARS, BY_KEY,
                    label_of, metadata_text, parse_list, parse_setting,
                    overlap_fault, pretty_units, read_csv, readout_fault,
                    reads_in_db,
-                   record_stats, record_time, safe_name, span_hz, stats_notes,
+                   record_stats, record_time, safe_name, span_hz, start_fault,
+                   stats_notes,
                    trace_units, trace_yscale, unique_base, unit_parts,
                    value_of,
                    write_csv)
@@ -1926,17 +1927,6 @@ class App:
                     if not go:
                         raise KeyboardInterrupt
                 for isf, start in enumerate(starts):
-                    if start is not None:
-                        # .10g, not %g: a stitch step is rarely a round number
-                        # and 6 digits would shave a fraction of a bin off it.
-                        # Through command(), so that if this analyzer answers
-                        # the graph-indexed spelling of STRF or SPAN the sweep
-                        # moves with it - a bare "SPAN 11" against an analyzer
-                        # that wanted "SPAN 0,11" is read as a graph number and
-                        # silently changes nothing, which is the one failure the
-                        # qform machinery exists to catch.
-                        self.an.put(self.an.command("STRF", f"{start:.10g}"))
-                        self.settle_due.set()
                     for isp, span in enumerate(spans):
                         if span is not None:
                             # Through write_settings rather than put(command()):
@@ -1951,6 +1941,25 @@ class App:
                                 {"SPAN": span}, log=self.log,
                                 hold_resets=not self.span_resets_ovlp.get())
                             self.settle_due.set()
+                        if start is not None:
+                            # After SPAN, every run (G7 SG-2): the analyzer
+                            # clamps a start the span in force would run past
+                            # 100 kHz, so STRF 99000 written under span 19 and
+                            # then narrowed to span 11 measured wherever the
+                            # clamp left it. STRF does not reinstall OVLP, so
+                            # it is safe after the held overlap goes back.
+                            # .10g, not %g: a stitch step is rarely a round
+                            # number and 6 digits would shave a fraction of a
+                            # bin off it. Through command(), so that if this
+                            # analyzer answers the graph-indexed spelling of
+                            # STRF the sweep moves with it - a bare spelling
+                            # against an analyzer that wanted "STRF 0,f" is read
+                            # as a graph number and silently changes nothing,
+                            # which is the one failure the qform machinery
+                            # exists to catch.
+                            self.an.put(self.an.command("STRF",
+                                                        f"{start:.10g}"))
+                            self.settle_due.set()
                         if self.abort.is_set():
                             raise KeyboardInterrupt
                         label = " ".join(
@@ -1964,7 +1973,7 @@ class App:
                             self.log("  " + self.eta(
                                 plan, len(done),
                                 time.perf_counter() - t_sweep - paused_s))
-                        freqs, amps, snap, notes = self.run_one()
+                        freqs, amps, snap, notes = self.run_one(start=start)
                         freqs_m[ic, isf, isp] = freqs
                         amps_m[ic, isf, isp] = amps
                         sweep_ylabel = trace_units(snap)
@@ -2098,9 +2107,12 @@ class App:
                 f"about {fmt_hms(left)} left, done ~{done_at:%H:%M}"
                 + ("" if finished else " (estimated)"))
 
-    def run_one(self):
+    def run_one(self, start=None):
         """One measurement: range, average, read out. Returns the trace, the
-        settings snapshot it was taken under and the notes for the metadata."""
+        settings snapshot it was taken under and the notes for the metadata.
+
+        `start` is the start frequency the sweep wrote, if it wrote one; a trace
+        whose bin 0 is elsewhere is marked SUSPECT (start_fault)."""
         notes = {}
         locked = self.lock.get()
         if locked:
@@ -2281,8 +2293,14 @@ class App:
             # above has to be reopened. A flat trace is the one failure that
             # looks entirely healthy from the settings alone.
             flat = floor_fault(amps)
-            if flat:
-                faults.append(flat)
+            # Same reopening for a start the analyzer moved: the sweep writes
+            # STRF after SPAN so it should not happen, but the matrix cell and
+            # the JSON carry the start that was asked for, not the one held.
+            moved = start_fault(freqs, start)
+            for late in (flat, moved):
+                if late:
+                    faults.append(late)
+            if flat or moved:
                 notes["trace quality"] = "SUSPECT: " + "; ".join(faults)
                 self.log(f"  *** {notes['trace quality']} ***")
 

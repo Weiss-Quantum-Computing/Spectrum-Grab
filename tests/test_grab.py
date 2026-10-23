@@ -841,6 +841,61 @@ ok("every run carries a countdown", log.count(" left, done ~") == 3)
 ok("the first is flagged as an estimate", "(estimated)" in log)
 root.destroy()
 
+print("\n--- a start the span would run past 100 kHz (G7 SG-2) ---")
+
+ok("start_fault is silent when no start was asked for",
+   S.start_fault(np.linspace(0, 390.625, 400), None) == "")
+ok("... and for a bin 0 within half a bin (BVAL rounds STRF 10828.125)",
+   S.start_fault(np.linspace(10828.1, 12387, 400), 10828.125) == "")
+ok("... but not for a start the analyzer moved",
+   "moved the start" in S.start_fault(np.linspace(0, 1e5, 400), 99000.0))
+
+# Was: STRF was written once per start, BEFORE the span loop, so it landed under
+# whatever span was in force. The analyzer clamps a start that span would run
+# past 100 kHz, so starts 99000 with spans 19, 11 measured span 11 from the
+# clamped start while the matrix cell said 99000. This fake clamps the way the
+# analyzer does, on either write.
+root, app = build_app(snap=dict(GOOD, SPAN="19"))
+app.save_csv.set(False), app.save_png.set(False), app.save_txt.set(False)
+app.save_npy.set(False), app.combined.set(False)
+app.lock.set(False), app.pause_cases.set(False)
+_plain_put = app.an.put
+
+
+def clamping_put(cmd):
+    _plain_put(cmd)
+    if cmd.partition(" ")[0] in ("SPAN", "STRF"):
+        width = S.span_hz(S.code_of(app.an.snap, "SPAN", 11))
+        if float(app.an.snap.get("STRF", 0)) + width > S.MAX_FREQ:
+            app.an.snap["STRF"] = f"{S.MAX_FREQ - width:.10g}"
+
+
+app.an.put = clamping_put
+cells, _real_run_one = [], app.run_one
+
+
+def spy_run_one(start=None):
+    got = _real_run_one(start=start)
+    cells.append((start, S.code_of(got[2], "SPAN"), float(got[0][0]),
+                  got[3]["trace quality"]))
+    return got
+
+
+app.run_one = spy_run_one
+app._grab_runs([""], [99000.0], [19, 11])
+root.update()
+heads = [c.partition(" ")[0] for c in app.an.sent
+         if c.partition(" ")[0] in ("SPAN", "STRF")]
+root.destroy()
+ok("STRF is written after every SPAN", heads == ["SPAN", "STRF"] * 2,
+   str(heads))
+ok("the span-11 cell measures from the 99000 Hz it is labelled with",
+   cells[1][1] == 11 and cells[1][2] == 99000.0, str(cells[1][:3]))
+ok("... and is clean", not cells[1][3].startswith("SUSPECT"), cells[1][3][:64])
+ok("the span-19 cell, which cannot start at 99000 Hz, is SUSPECT",
+   cells[0][3].startswith("SUSPECT") and "moved the start" in cells[0][3],
+   cells[0][3][:64])
+
 # ------------------------------------- 9. the combined plot as it builds
 
 print("\n--- the sweep draws itself as it goes ---")

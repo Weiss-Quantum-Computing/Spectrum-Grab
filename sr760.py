@@ -402,6 +402,33 @@ def floor_fault(amps, min_unique=8):
             f"coarser than the signal")
 
 
+def start_fault(freqs, start):
+    """Why this trace does not begin at the start frequency asked for, or "".
+
+    The analyzer clamps a start that the current span would run past MAX_FREQ,
+    silently, so a sweep cell labelled with the start it wrote can hold a band
+    it never measured. Bin 0 reads STRF (26 Aug 2026 segments: STRF 10828.125,
+    BVAL 0 10828.1, against a 3.9 Hz bin spacing), so anything past half a bin
+    is the analyzer having moved it. Silent when no start was asked for or the
+    trace is too short to have a spacing.
+    """
+    if start is None:
+        return ""
+    f = np.asarray(freqs, dtype=float)
+    f = f[np.isfinite(f)]
+    if f.size < 2:
+        return ""
+    spacing = float(np.median(np.diff(f)))
+    if not np.isfinite(spacing) or spacing <= 0:
+        return ""
+    if abs(float(f[0]) - float(start)) <= spacing / 2.0:
+        return ""
+    return (f"the trace starts at {f[0]:.6g} Hz, not the {float(start):.6g} Hz "
+            f"asked for - the analyzer moved the start (it clamps one the span "
+            f"would run past {MAX_FREQ:g} Hz), so the sweep's start axis does "
+            f"not describe this run")
+
+
 def readout_fault(snap):
     """Why the scale this trace is labelled on is an assumption, or "".
 
