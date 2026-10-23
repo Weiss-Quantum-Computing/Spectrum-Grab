@@ -2334,5 +2334,99 @@ ok("the threshold is where it says it is",
    S.floor_fault(np.arange(400.0), min_unique=8) == ""
    and S.floor_fault(np.repeat(np.arange(4.0), 100), min_unique=8) != "")
 
+
+# ---------------------------------------------------------------------------
+# 16. connect never sends OUTP 1 during a scan (G7 SG-3)
+#
+# Was: the RS232-output recovery (clear, OUTP 1, ask again) ran for every GPIB
+# device that was slow to answer *IDN?. OUTP 1 is SCPI "output on" for most
+# sources, so a blank-address connect would switch on any such source on the
+# bus. A fake ResourceManager only - nothing here reaches VISA.
+# ---------------------------------------------------------------------------
+
+print("\n--- connect: OUTP 1 only at an address that was given ---")
+
+
+class FakeDev:
+    def __init__(self, res, answers, rs232=False):
+        self.res, self.answers, self.rs232 = res, answers, rs232
+        self.writes, self.closed, self.timeout = [], False, None
+        self.write_termination = None
+
+    def query(self, q):
+        if self.answers is None or self.rs232:
+            raise TimeoutError("VI_ERROR_TMO")
+        return self.answers
+
+    def write(self, cmd):
+        self.writes.append(cmd)
+        if cmd == "OUTP 1" and self.answers is not None:
+            self.rs232 = False
+
+    def clear(self):
+        self.writes.append("<clear>")
+
+    def close(self):
+        self.closed = True
+
+
+class FakeRM:
+    def __init__(self, table):
+        self.table, self.opened = table, []
+
+    def list_resources(self):
+        return tuple(self.table)
+
+    def open_resource(self, res):
+        answers, rs232 = self.table[res]
+        dev = FakeDev(res, answers, rs232)
+        self.opened.append(dev)
+        return dev
+
+    def close(self):
+        raise AssertionError("a given ResourceManager must not be closed")
+
+
+bus = {"GPIB0::5::INSTR": (None, False),        # a silent SCPI source
+       "GPIB0::10::INSTR": ("Stanford_Research_Systems,SR760,s/n41234,v1",
+                            True)}             # an SR760 left on RS232 output
+rm = FakeRM(bus)
+an = S.SR760(connect=False, resource_manager=rm)
+try:
+    an.connect(None)
+    scanned = "connected"
+except RuntimeError as exc:
+    scanned = str(exc)
+ok("a scan sends OUTP 1 to nothing",
+   not any("OUTP 1" in d.writes for d in rm.opened),
+   str([(d.res, d.writes) for d in rm.opened]))
+ok("... so the RS232-stuck SR760 is not found by it",
+   scanned.startswith("No SR760 found"), scanned[:60])
+ok("... and the error says to give the address",
+   "connect again" in scanned and S.DEFAULT_ADDRESS in scanned, scanned[-120:])
+
+rm = FakeRM(bus)
+an = S.SR760(connect=False, resource_manager=rm)
+idn = an.connect("GPIB0::10::INSTR")
+ok("a typed address still gets the RS232 recovery",
+   "SR760" in idn and rm.opened[0].writes == ["<clear>", "OUTP 1"],
+   str(rm.opened[0].writes))
+ok("... and only that address was opened",
+   [d.res for d in rm.opened] == ["GPIB0::10::INSTR"])
+
+seen = []
+rm = FakeRM({"GPIB0::5::INSTR": ("ACME,SOURCE,1,1", False)})
+an = S.SR760(connect=False, resource_manager=rm, log=seen.append)
+an.connect("GPIB0::5::INSTR")
+ok("a typed address that answers as something else is logged",
+   any("not an SR760" in m for m in seen), str(seen))
+
+rm = FakeRM({"GPIB0::5::INSTR": ("ACME,SOURCE,1,1", False),
+             "GPIB0::10::INSTR": ("Stanford_Research_Systems,SR760,s/n1,v1",
+                                  False)})
+an = S.SR760(connect=False, resource_manager=rm)
+ok("a scan still finds an SR760 that answers on GPIB",
+   "SR760" in an.connect(None) and an.addr == "GPIB0::10::INSTR")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nAll {checks} checks passed.")

@@ -1181,6 +1181,7 @@ class SR760:
             raise RuntimeError("No GPIB resources found - check the cable and "
                                "that NI MAX sees the SR760.")
         problems = []
+        silent = 0
         for res in candidates:
             dev = None
             try:
@@ -1194,6 +1195,14 @@ class SR760:
                 try:
                     idn = dev.query("*IDN?").strip()
                 except Exception:
+                    if not addr:
+                        # Never during a scan (G7 SG-3): OUTP 1 is SCPI "output
+                        # on" for most sources, so sending it to every device
+                        # that is slow to answer would switch on any SCPI
+                        # source on the bus. Only an address the user named
+                        # as the SR760 gets the recovery.
+                        silent += 1
+                        raise
                     # An analyzer left on the RS232 output takes GPIB commands
                     # but answers down the serial port, so the first query just
                     # times out. Point the output back at GPIB and ask again -
@@ -1211,11 +1220,21 @@ class SR760:
                 continue
             # A typed address is taken at its word; a scan only claims an SR760.
             if addr or "SR760" in idn.upper():
+                if "SR760" not in idn.upper():
+                    self.log(f"  ({res} answered '{idn}', which is not an "
+                             f"SR760 - connected anyway because the address "
+                             f"was given)")
                 dev.timeout = OP_TIMEOUT_MS
                 self.inst, self.idn, self.addr = dev, idn, res
                 return idn
             problems.append(f"  {res}: not an SR760 ({idn})")
             dev.close()
+        if silent:
+            problems.append(
+                f"  ({silent} device(s) did not answer *IDN?. An SR760 left on "
+                f"its RS232 output answers only after OUTP 1, which a scan "
+                f"does not send - give its address, {DEFAULT_ADDRESS} by "
+                f"default, and connect again.)")
         raise RuntimeError("No SR760 found.\n" + "\n".join(problems))
 
     def close(self):

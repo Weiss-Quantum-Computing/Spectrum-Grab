@@ -830,9 +830,12 @@ ignored, each value falling back to its default independently.
 ## Notes
 
 - The SR760 ends a command at the first line feed, so the write terminator is
-  pinned to `\n`. If the first `*IDN?` times out the app assumes the analyzer is
-  still answering on RS232, sends `OUTP 1` and asks once more - which is the
-  `*IDN?` timeout the scripts worked around by hand.
+  pinned to `\n`. If the first `*IDN?` at a given address times out the app
+  assumes the analyzer is still answering on RS232, sends `OUTP 1` and asks
+  once more - which is the `*IDN?` timeout the scripts worked around by hand.
+  A blank-address scan never sends it: `OUTP 1` is "output on" for most SCPI
+  sources, so a scan only asks `*IDN?`, and an analyzer stuck on RS232 is found
+  by typing its address (`GPIB0::10::INSTR` by default).
 - A measurement is finished when bit 0 of the serial poll byte comes back set;
   the poll starts half a second after `STRT` so it cannot catch the bit left
   over from the previous run.
