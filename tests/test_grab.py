@@ -390,6 +390,40 @@ ok("... and that NAVG is not in force",
 ok("the default is the old behaviour",
    S.record_stats(11, 30.0, navg=100, ovlp=0)["n_indep"] == on["n_indep"])
 
+# Was (G7 SG-1): at span 19 (T_rec 4 ms) a NAVG 100, OVLP 0 average lasts
+# 0.4 s but is timed at >= 0.75 s, because wait_done sleeps 0.5 s before its
+# first poll. The clock count said 187.5 records and a 0.073 bar for a trace
+# worth 100 and 0.10, and "NAVG / independent 0.53" printed as fine.
+wide = S.record_stats(19, 0.75, navg=100, ovlp=0)
+ok("the uncapped clock still overcounts at span 19 (the old figure)",
+   abs(wide["n_indep"] - 187.5) < 1e-9 and not wide["capped"],
+   f"n_indep {wide['n_indep']:.1f}")
+ok("... and stats_notes now calls the ratio below 1 a timing artefact",
+   "timing artefact" in S.stats_notes(wide)["NAVG / independent"],
+   S.stats_notes(wide)["NAVG / independent"])
+done = S.record_stats(19, 0.75, navg=100, ovlp=0, finished=True)
+ok("a finished linear average is capped at NAVG at no overlap",
+   done["n_indep"] == 100.0 and done["capped"],
+   f"n_indep {done['n_indep']:.1f}, 1 sigma {done['rel_err']:.3g}")
+ok("... so its 1 sigma is 0.10, not 0.073", abs(done["rel_err"] - 0.1) < 1e-12)
+ok("... and keeps the clock's figure for the record",
+   abs(done["n_indep_clock"] - 187.5) < 1e-9)
+dn = S.stats_notes(done)
+ok("... the metadata says it was capped",
+   "capped" in dn.get("independent records (clock)", ""),
+   dn.get("independent records (clock)", "missing"))
+ok("... and the ratio reads 1.00 with no artefact flag",
+   dn["NAVG / independent"] == "1.00", dn["NAVG / independent"])
+ovl = S.record_stats(19, 0.75, navg=100, ovlp=50, finished=True)
+ok("with overlap the cap is independent_records(navg, ovlp)",
+   ovl["n_indep"] == S.independent_records(100, 50), f"{ovl['n_indep']:.1f}")
+slow = S.record_stats(11, 30.0, navg=100, ovlp=0, finished=True)
+ok("a run shorter than its cap keeps the clock's count",
+   slow["n_indep"] == on["n_indep"] and not slow["capped"])
+ok("averaging off still wins over finished",
+   S.record_stats(19, 0.75, navg=100, ovlp=0, averaged=False,
+                  finished=True)["n_indep"] == 1.0)
+
 print("\n--- the averaging itself ---")
 
 ok("a linear RMS average is not a fault", S.averaging_fault(GOOD) == "")
@@ -569,6 +603,22 @@ ok("averaging off gives one independent record",
    notes["independent records"] == "1.0", notes["independent records"])
 ok("... and a 1 sigma of 1", notes["relative error (1 sigma)"] == "1")
 ok("... and the metadata says why", "OFF" in notes.get("averaging", ""))
+
+# The panel passes `finished` for a linear average that set its completion bit.
+# A wait that lasts longer than the average itself - here 0.3 s for 10 records
+# of 4 ms, the span-19 case of G7 SG-1 - must not buy 75 records.
+_real_wait = FakeAn.wait_done
+FakeAn.wait_done = lambda self, timeout, stop=None, poll=0.25: (
+    time.sleep(0.3) or "done")
+try:
+    notes = capture(dict(GOOD, SPAN="19", NAVG="10"))
+finally:
+    FakeAn.wait_done = _real_wait
+ok("a span-19 run timed longer than its average is capped at NAVG",
+   notes["independent records"] == "10.0", notes["independent records"])
+ok("... and says the clock figure was capped",
+   "capped" in notes.get("independent records (clock)", ""),
+   notes.get("independent records (clock)", "missing"))
 
 notes = capture({k: v for k, v in GOOD.items() if k not in ("UNIT0", "DISP0")})
 ok("a trace labelled on a fallback is SUSPECT",

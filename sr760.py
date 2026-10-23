@@ -987,7 +987,7 @@ def capture_time(span_code, navg=None, ovlp=None, averaged=True,
 
 
 def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS,
-                 averaged=True):
+                 averaged=True, finished=False):
     """How much independent averaging a run actually bought.
 
     NAVG counts records the analyzer averaged, not independent ones. With OVLP
@@ -1015,6 +1015,19 @@ def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS,
     count would have claimed 29 records and a 0.19 bar for a 30 s run at the
     390 Hz span, five times better than the trace really is.
 
+    The clock also overcounts at wide spans, the other way round. `elapsed`
+    is timed around start() and wait_done, which sleeps a fixed 0.5 s before
+    its first poll and then polls every 0.25 s - so at span 19 (T_rec 4 ms) a
+    NAVG 100, OVLP 0 average that lasts 0.4 s is timed at 0.75 s, and the count
+    came out at 187 records and a 0.073 bar for a trace worth 100 and 0.10.
+    `finished` is the caller saying the analyzer ran a LINEAR average to its
+    own NAVG count (the completion bit, AVGM linear): the average then holds at
+    most independent_records(navg, ovlp) records however long the wait was, so
+    the count is capped there. `n_indep_clock` keeps the uncapped figure and
+    `capped` says the cap bit. The default (False) is the old behaviour, which
+    run_protocol relies on; stats_notes flags the ratio below 1 that the
+    uncapped count produces.
+
     Returns a dict of plain numbers; NaN wherever the inputs do not support the
     calculation rather than a guess."""
     t_rec = record_time(span_code, n_bins)
@@ -1024,11 +1037,18 @@ def record_stats(span_code, elapsed_s, navg=None, ovlp=None, n_bins=N_BINS,
                    if np.isfinite(t_rec) and t_rec > 0 else float("nan"))
     else:
         n_indep = 1.0
+    n_clock = n_indep
+    capped = False
+    if averaged and finished and navg:
+        most = independent_records(navg, ovlp)
+        if np.isfinite(most) and np.isfinite(n_indep) and n_indep > most:
+            n_indep, capped = most, True
     rel_err = (1.0 / np.sqrt(n_indep)
                if np.isfinite(n_indep) and n_indep > 0 else float("nan"))
     out = {"t_rec_s": t_rec, "elapsed_s": elapsed, "n_indep": n_indep,
            "rel_err": rel_err, "navg": navg, "overlap_pct": ovlp,
-           "averaged": bool(averaged)}
+           "averaged": bool(averaged), "n_indep_clock": n_clock,
+           "capped": capped}
     # The ratio is the point of the whole calculation: it says how far NAVG is
     # from what the run can actually support. It is a statement about an average
     # that was taken, so it means nothing when none was.
@@ -1063,9 +1083,21 @@ def stats_notes(stats):
                else "  <- not in force, averaging is off"))
         ratio = stats.get("navg_over_indep", float("nan"))
         if np.isfinite(ratio):
+            # Below 1 cannot be real - an average of NAVG records holds at most
+            # NAVG independent ones - so it is the clock overcounting: the
+            # fixed settle and polling latency in the timed wait, which at the
+            # widest spans is longer than the average itself.
             notes["NAVG / independent"] = (
                 f"{ratio:.2f}" + ("  <- NAVG overstates the statistics"
-                                  if ratio > 1.5 else ""))
+                                  if ratio > 1.5 else
+                                  "  <- below 1 is a timing artefact: the "
+                                  "clock overcounts, the bar above is too "
+                                  "small" if ratio < 0.9 else ""))
+    if stats.get("capped"):
+        notes["independent records (clock)"] = (
+            g("n_indep_clock", "{:.1f}")
+            + "  <- more than the finished average can hold, capped at "
+              "what NAVG and the overlap allow")
     if stats.get("overlap_pct") is not None:
         notes["overlap (%)"] = f"{stats['overlap_pct']:g}"
     return notes

@@ -2247,10 +2247,18 @@ class App:
             # at all and the error bar is a single bin's own. An unreadable AVGO
             # takes the same branch, which is the safe direction to be wrong in,
             # and averaging_fault has already said so above.
+            # `finished` caps the clock's count at what NAVG and the overlap
+            # can hold: at span 19 the fixed 0.5 s settle in wait_done is longer
+            # than a 100-record average, and the bar came out 30 % too good.
+            # Only for a linear average that set its own completion bit -
+            # "done" survives above only when the average finishes - and with
+            # AVGM still linear in the snapshot read after it.
             notes.update(stats_notes(record_stats(
                 code_of(snap, "SPAN", span_code), measured,
                 navg=code_of(snap, "NAVG"), ovlp=value_of(snap, "OVLP"),
-                averaged=code_of(snap, "AVGO", 0) == 1)))
+                averaged=code_of(snap, "AVGO", 0) == 1,
+                finished=(state == "done"
+                          and code_of(snap, "AVGM") == 0))))
             binary = self.binary.get() and binary_valid(snap)
             if self.binary.get() and not binary:
                 self.log(f"  ({binary_refusal(snap)})")
