@@ -270,6 +270,13 @@ def load_sequences(paths, log=None):
     return sorted(out, key=lambda s: s["name"])
 
 
+class TimeTraces(list):
+    """Traces whose x is time, not frequency: a zero-span capture. A list
+    like any other to everything that handles one; draw_traces reads the
+    label off it, so it follows the traces from the file to the panel."""
+    xlabel = "Time after the trigger (s)"
+
+
 def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
                 yscale="linear", refs=(), fonts=None):
     """Draw one or more traces onto an existing axes.
@@ -293,6 +300,9 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
     wrap widths follow them, so a title that fits across the file in two lines
     is not folded into four on the screen."""
     fonts = PNG_FONTS if fonts is None else fonts
+    # A list of traces can say what its x axis is (TimeTraces); a plain list
+    # is a spectrum.
+    xlabel = getattr(traces, "xlabel", "Frequency (Hz)")
     for i, (freqs, amps, label) in enumerate(refs):
         ax.plot(freqs, amps, lw=1.0, label=label, zorder=1,
                 color=REF_GREYS[i % len(REF_GREYS)])
@@ -330,9 +340,9 @@ def draw_traces(ax, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
 
     if labplot is not None:
         # Labels and the lab grid (30 %, minor lines too on a log axis).
-        labplot.finish(ax, "Frequency (Hz)", pretty_units(ylabel))
+        labplot.finish(ax, xlabel, pretty_units(ylabel))
     else:
-        ax.set_xlabel("Frequency (Hz)")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel(pretty_units(ylabel))
         ax.grid(True, which="both" if ax.get_yscale() == "log" else "major")
     # The title is the name of the capture and nothing else, so a folder of
@@ -430,6 +440,7 @@ class App:
     WINDOW_TITLE = "Spectrum Grab - SR760 FFT"
     DEFAULT_TITLE = "sr760"
     DEFAULT_ADDR = DEFAULT_ADDRESS
+    PANEL_FIGSIZE = PANEL_FIGSIZE
     drv = sr760
 
     def make_analyzer(self):
@@ -843,7 +854,7 @@ class App:
             # wheel zoom, right-click copy, Save - all its own. Save proposes
             # <title>_<case>.png in the session's folder.
             self.panel = labplot.PlotPanel(
-                self.shot_frame, draw=self.draw_panel, figsize=PANEL_FIGSIZE,
+                self.shot_frame, draw=self.draw_panel, figsize=self.PANEL_FIGSIZE,
                 save_name=self.plot_stem, save_dir=self.target_dir,
                 on_status=self.log)
             self.panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))

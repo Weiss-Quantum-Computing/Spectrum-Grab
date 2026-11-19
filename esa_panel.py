@@ -19,6 +19,9 @@ What differs, and why it is a different class rather than a mode:
 * A capture takes the analyser to single sweep, triggers one measurement (a
   whole average when averaging is on), reads the trace in ASCII and then, by
   default, puts continuous sweep back and hands the front panel back.
+* In zero span a capture is power against time: the files and the plot say
+  seconds, and a sweep armed on a trigger waits for it as long as the
+  measurement timeout. The Power steps window (esa_steps.py) is built on that.
 
 The instrument itself is e4405b.py, which is also the scripting library.
 """
@@ -34,6 +37,7 @@ from tkinter import messagebox, ttk
 import numpy as np
 
 import e4405b as E
+import esa_steps
 import spectrum_grab as sg
 from spectrum_grab import App, Figure, MAX_SWEEP_RUNS, STATUS_CHARS, \
     SUBTITLE_SEP, elide
@@ -51,6 +55,10 @@ class EsaApp(App):
     DEFAULT_ADDR = E.DEFAULT_ADDRESS
     drv = E
     last_ylabel = "dBm"
+    # A shorter plot than the SR760 panel's to start with: this panel has six
+    # groups of settings under it, and together they have to fit 1000 px.
+    PANEL_FIGSIZE = (6.0, 3.5)
+    steps_dialog = None       # the Power steps window, while it is open
 
     def make_analyzer(self):
         return E.E4405B(connect=False, log=self.log)
@@ -151,6 +159,14 @@ class EsaApp(App):
                                   "idle",
                         variable=self.local).pack(side="left")
 
+        # Zero-span power steps have a window of their own (esa_steps): the
+        # boxes live here so they are in the config either way.
+        self.steps = esa_steps.make_vars()
+        self.steps_dialog = None
+        self.steps_btn = ttk.Button(row, text="Power steps...",
+                                    command=self.open_steps)
+        self.steps_btn.pack(side="right")
+
         grid = ttk.Frame(f)
         grid.pack(fill="x", padx=6, pady=(2, 6))
         for i, (label, attr, default) in enumerate(
@@ -183,7 +199,8 @@ class EsaApp(App):
             grid = ttk.Frame(frame)
             grid.pack(fill="x", padx=6, pady=4)
             for i, s in enumerate(settings):
-                row, col = divmod(i, 2)
+                # Three a row: two was more rows than a 1080-line screen has.
+                row, col = divmod(i, 3)
                 ttk.Label(grid, text=s.label + ":").grid(
                     row=row, column=col * 2, sticky="e", padx=(0, 4), pady=1)
                 self.setting_widget(grid, s, row, col * 2 + 1)
@@ -221,6 +238,19 @@ class EsaApp(App):
         self.refresh_compare()
         self.connect_btn.configure(state="disabled" if busy else "normal")
         self.stop_btn.configure(state="normal" if busy else "disabled")
+        if self.steps_dialog is not None:
+            self.steps_dialog.refresh()
+
+    def open_steps(self):
+        if self.steps_dialog is None:
+            self.steps_dialog = esa_steps.StepsDialog(self)
+        else:
+            self.steps_dialog.lift()
+
+    def shutdown(self):
+        if self.steps_dialog is not None:
+            self.steps_dialog.close()
+        super().shutdown()
 
     def refresh_hold(self):
         pass
@@ -260,6 +290,7 @@ class EsaApp(App):
             "resume_cont": self.resume_cont, "local": self.local,
             "settle_s": self.settle_s, "timeout_s": self.timeout_s,
             "ymin": self.ymin, "ymax": self.ymax, "interval": self.interval,
+            **{f"steps_{key}": var for key, var in self.steps.items()},
         }
 
     def y_window(self, ylabel):
@@ -420,12 +451,17 @@ class EsaApp(App):
             i = int(np.argmax(amps))
             self.log(f"Peek: {len(freqs)} points in "
                      f"{time.perf_counter() - t0:.2f} s, peak {amps[i]:.4g} "
-                     f"{ylabel} at {E.fmt_hz(freqs[i])} - nothing saved")
+                     f"{ylabel} at "
+                     + (f"{freqs[i]:.6g} s" if E.zero_span(snap)
+                        else E.fmt_hz(freqs[i])) + " - nothing saved")
             self.show_health(self.an.refresh_status())
             if Figure is None:
                 self.log("  (no matplotlib: there is nothing to draw it with)")
                 return
-            self.remember_plot([(freqs, amps, "peek")],
+            traces = [(freqs, amps, "peek")]
+            if E.zero_span(snap):
+                traces = sg.TimeTraces(traces)
+            self.remember_plot(traces,
                                self.plot_title(note="peek"),
                                self.plot_subtitle(snap, freqs), ylabel,
                                E.trace_yscale(snap), self.refs_for(ylabel))
@@ -583,8 +619,9 @@ class EsaApp(App):
                 raise KeyboardInterrupt
             notes["settle (s)"] = f"{settle:g}"
 
-        before = self.read_settings("SWT", "AVG", "NAVG")
+        before = self.read_settings("SWT", "AVG", "NAVG", "TRIGSRC")
         n, est = E.sweep_count(before), E.capture_time(before)
+        trigger = E.waits_for_trigger(before)
         timeout = self.float_of(self.timeout_s, 600.0, "timeout")
         if np.isfinite(est) and est > timeout:
             self.log(f"  (this should take about {E.fmt_hms(est)}, longer "
@@ -592,7 +629,9 @@ class EsaApp(App):
                      f"the trace is read part way through)")
         self.log("  measuring..."
                  + (f" {n} sweeps, about {E.fmt_hms(est)}"
-                    if n > 1 and np.isfinite(est) else ""))
+                    if n > 1 and np.isfinite(est) else "")
+                 + (f" waiting for the {trigger.lower()} trigger, up to "
+                    f"{timeout:g} s" if trigger else ""))
         t0 = time.perf_counter()
         self.an.start(log=self.log)
         state = self.an.wait_done(timeout, stop=self.abort.is_set)
@@ -627,9 +666,12 @@ class EsaApp(App):
         t0 = time.perf_counter()
         freqs, amps = self.an.trace(snap)
         transferred = time.perf_counter() - t0
-        for fault in (E.flat_fault(amps), E.band_fault(freqs, band)):
+        for fault in (E.flat_fault(amps), E.band_fault(freqs, band),
+                      E.level_fault(snap, amps)):
             if fault:
                 faults.append(fault)
+        if trigger:
+            notes["trigger"] = trigger
 
         notes["trace quality"] = ("SUSPECT: " + "; ".join(faults) if faults
                                   else "clean")
@@ -645,7 +687,7 @@ class EsaApp(App):
             notes["resolution"] = resolution
         if E.zero_span(snap):
             notes["x axis"] = ("zero span: the first column is time in "
-                               "seconds, not frequency")
+                               "seconds after the trigger, not frequency")
         notes["transfer"] = "ASCII (TRAC? TRACE1)"
         notes["transfer time (s)"] = f"{transferred:.3f}"
         self.log(f"  {len(freqs)} points in {transferred:.2f} s")
@@ -675,7 +717,12 @@ class EsaApp(App):
         stem = os.path.basename(base)
 
         if self.save_csv.get():
-            E.write_csv(base + ".csv", freqs, amps, ylabel)
+            if E.zero_span(snap):
+                np.savetxt(base + ".csv", np.column_stack([freqs, amps]),
+                           delimiter=",", comments="",
+                           header=f"Time (s),{E.safe_name(ylabel)}")
+            else:
+                E.write_csv(base + ".csv", freqs, amps, ylabel)
             self.log(f"  {stem}.csv")
         if self.save_txt.get():
             extra = {
@@ -688,7 +735,10 @@ class EsaApp(App):
             with open(base + ".txt", "w", encoding="utf-8") as fh:
                 fh.write(E.metadata_text(self.an, snap, extra, self.command))
         if self.save_png.get():
-            self.write_plot(base + ".png", [(freqs, amps, stem)],
+            traces = [(freqs, amps, stem)]
+            if E.zero_span(snap):
+                traces = sg.TimeTraces(traces)
+            self.write_plot(base + ".png", traces,
                             self.plot_title(case),
                             self.plot_subtitle(snap, freqs, notes), ylabel,
                             E.trace_yscale(snap), show=show, case=case)

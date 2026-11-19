@@ -25,6 +25,7 @@ import tkinter as tk
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import e4405b as E                                   # noqa: E402
+import powersteps as P                               # noqa: E402
 import spectrum_grab as sg                           # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="esa_test_")
@@ -78,9 +79,14 @@ class FakeVisa:
             "DISP:WIND:TRAC:Y:SPAC": "LOG", "DISP:WIND:TRAC:Y:PDIV": "+1.000E+01",
             "INP:COUP": "AC", "DET": "POS", "DET:AUTO": "1", "AVER": "0",
             "AVER:COUN": "+100", "AVER:TYPE": "VID", "TRAC1:MODE": "WRIT",
+            "TRIG:SOUR": "IMM", "TRIG:EXT:SLOP": "POS",
+            "TRIG:OFFS": "+0.00000000E+000", "TRIG:OFFS:STAT": "0",
+            "TRIG:VID:LEV": "-2.500E+01",
         }
         self.opc = False
         self.flat = False
+        self.triggers = True           # False: armed, and no trigger comes
+        self.trace_fn = None           # n -> the trace, when a test wants one
         self.silent = set()            # queries that time out
 
     def write(self, cmd):
@@ -88,7 +94,7 @@ class FakeVisa:
         for part in cmd.split(";"):
             head, _, value = part.strip().partition(" ")
             if head == "*OPC":
-                self.opc = True
+                self.opc = self.triggers
             elif head == "*CLS":
                 self.errq, self.opc = [], False
             elif head in self.state and value:
@@ -129,6 +135,8 @@ class FakeVisa:
         n = int(float(self.state["SWE:POIN"]))
         if self.flat:
             return [-120.0] * n
+        if self.trace_fn is not None:
+            return list(self.trace_fn(n))
         return list(-60.0 + np.random.default_rng(4405).normal(0, 1.0, n))
 
     def clear(self):
@@ -397,6 +405,271 @@ app.ymin.set("-100")
 app.ymax.set("0")
 ok("typed y limits are used for dB traces only",
    app.y_window("dBm") == (-100.0, 0.0) and app.y_window("V") == (None, None))
+root.update()
+root.destroy()
+
+
+# ------------------------------------------------ zero span and power steps
+
+ok("the trigger is in the grid, slope under its real header",
+   E.BY_KEY["TRIGSLOPE"].scpi == "TRIG:EXT:SLOP"
+   and E.parse_setting(E.BY_KEY["TRIGSRC"], "External") == "EXT")
+pvt = E.power_vs_time(9.19263177e9, 0.1, 1e6, 401)
+ok("power against time is zero span, sample detector, VBW not below RBW",
+   pvt["FSPAN"] == "0" and pvt["DET"] == "SAMP" and pvt["VBW"] == pvt["RBW"]
+   and list(pvt)[:2] == ["FCENT", "FSPAN"] and "TRIGSRC" not in pvt)
+ok("the shortest sweep is 10 us a point and never under 4 ms",
+   E.min_zero_span_sweep(401) == 4e-3
+   and abs(E.min_zero_span_sweep(8192) - 81.91e-3) < 1e-12)
+try:
+    E.power_vs_time(9.19e9, 1e-3)
+    ok("a sweep too short for this unit is refused", False)
+except ValueError:
+    ok("a sweep too short for this unit is refused", True)
+
+an = fake_analyzer()
+an.inst.state["FREQ:SPAN"] = "+0.00000000000E+000"
+an.inst.sent.clear()
+an.write_settings({"RBWAUTO": "1", "SWTAUTO": "1", "ATTAUTO": "1",
+                   "FSPAN": "1e9"})
+sent = [c for c in an.inst.sent if c != "*CLS" and not c.endswith("?")]
+ok("leaving zero span, the RBW and sweep-time autos go after the span",
+   sent == ["POW:ATT:AUTO 1", "FREQ:SPAN 1000000000", "BAND:AUTO 1",
+            "SWE:TIME:AUTO 1"], str(sent))
+zs = {"FSPAN": "0", "FSTART": "9e9", "FSTOP": "9e9", "SWT": "0.1",
+      "POINTS": "401", "RBW": "1e6", "YUNIT": "DBM", "ATT": "10",
+      "RLEV": "10"}
+ok("a zero-span point is described in time",
+   "us a point" in E.resolution_note(zs)
+   and "settle" in E.resolution_note(zs))
+ok("a peak that overdrives the analyser's own mixer is a fault",
+   "mixer" in E.level_fault(zs, [5.0, -40.0])
+   and not E.level_fault(dict(zs, ATT="30"), [5.0, -40.0])
+   and "reference level" in E.level_fault(dict(zs, ATT="40", RLEV="0"),
+                                          [5.0]))
+an = fake_analyzer()
+an.inst.state.update({"FREQ:SPAN": "0", "FREQ:STAR": "9.0E+009",
+                      "FREQ:STOP": "9.0E+009", "SWE:TIME": "1.0E-001",
+                      "TRIG:OFFS": "-2.0E-003", "TRIG:OFFS:STAT": "1"})
+tt, _ = an.trace()
+ok("the time axis starts at the trigger offset",
+   abs(tt[0] + 2e-3) < 1e-12 and abs(tt[-1] - 0.098) < 1e-12)
+ok("free run waits for nothing, external is named",
+   E.waits_for_trigger({"TRIGSRC": "IMM"}) == ""
+   and E.waits_for_trigger({"TRIGSRC": "EXT"}) == "External")
+
+# A staircase as the chain would play it: eight words, 5 ms steps 10 ms
+# apart from 4 ms, a floor at -70 dBm, and a top that compresses.
+WORDS = [102, 204, 409, 819, 1577, 2457, 3276, 4095]
+SAT_MW = 10.0 ** (8.0 / 10.0)
+
+
+def chain_dbm(word, linear=False):
+    p = 10.0 ** (10.0 / 10.0) * (word / 4095.0) ** 2      # +10 dBm full scale
+    return 10 * np.log10(p if linear else p / (1 + p / SAT_MW))
+
+
+def staircase(n, words=WORDS, noise=0.05, seed=1, linear=False):
+    t = np.linspace(0.0, 0.1, n)
+    y = np.full(n, -70.0)
+    for i, w in enumerate(words):
+        on = (t >= 4e-3 + i * 10e-3) & (t < 9e-3 + i * 10e-3)
+        y[on] = chain_dbm(w, linear)
+    return t, y + np.random.default_rng(seed).normal(0, noise, n)
+
+
+t, y = staircase(401)
+steps = P.step_levels(t, y, 4e-3, 5e-3, 10e-3, 8)
+true = np.array([chain_dbm(w) for w in WORDS])
+ok("typed timing reads every step to a few hundredths of a dB",
+   np.max(np.abs(np.array([s.dbm for s in steps]) - true)) < 0.05
+   and all(s.points >= 10 for s in steps))
+bursts, floor = P.find_bursts(t, y)
+ok("the same steps are found as bursts, with no timing",
+   len(bursts) == 8 and abs(floor + 70) < 0.3
+   and np.max(np.abs(np.array([s.dbm for s in bursts]) - true)) < 0.05)
+two = P._level(0, np.arange(4.0), np.array([-20.0, -30.0, -20.0, -30.0]),
+               0.0, 3.0)
+ok("a level is the mean of the power, not of the decibels",
+   abs(two.dbm - 10 * np.log10((0.01 + 0.001) / 2)) < 1e-9
+   and abs(two.dbm + 25) > 2)
+late = P.step_levels(t, y, 4e-3, 5e-3, 10e-3, 12)
+ok("a step past the end of the sweep is kept, and empty",
+   len(late) == 12 and late[-1].points == 0 and np.isnan(late[-1].dbm))
+rel, law, usable = P.response(WORDS, [s.dbm for s in steps],
+                              P.floor_between(t, y, 4e-3, 5e-3, 10e-3, 8))
+ok("against the word-squared law the low steps sit on it and the top "
+   "falls away",
+   abs(rel[1]) < 0.1 and rel[-1] < -3 and all(np.diff(rel[3:]) < 0)
+   and usable.all(), str(np.round(rel, 2)))
+_, lin = staircase(401, linear=True)
+lin_steps = P.step_levels(t, lin, 4e-3, 5e-3, 10e-3, 8)
+points = P.amplitude_table(WORDS, [s.dbm for s in lin_steps])
+ok("a linear chain's table is power proportional to the word squared, "
+   "1 W at the anchor",
+   points[0] == (0.0, 0.0) and len(points) == 9
+   and all(abs(pw / (f * 4095 / P.ANCHOR_WORD) ** 2 - 1) < 0.02
+           for pw, f in points[1:]),
+   str(points[5]))
+points = P.amplitude_table(WORDS, [s.dbm for s in steps], 1.0, 1577)
+ok("a compressing chain needs more than four times the word... "
+   "its table tops out below the linear chain's",
+   abs(points[5][0] - 1.0) < 1e-9 and points[-1][0] < (4095 / 1577) ** 2 * 0.8)
+ok("the table file reads back as the compiler's format",
+   P.read_table(P.table_text(points, ["a comment", ""])) ==
+   [(float(f"{a:.10g}"), float(f"{b:.10g}")) for a, b in points])
+for label, words, levels, kw in (
+        ("a power that does not rise", [100, 200, 300], [-30, -20, -21], {}),
+        ("a word played twice", [100, 100, 300], [-30, -29, -20], {}),
+        ("an anchor outside the words played", [100, 200], [-30, -24], {}),
+        ("a single step", [1577], [-10], {})):
+    try:
+        P.amplitude_table(words, levels, **kw)
+        ok(f"{label} is refused", False)
+    except ValueError:
+        ok(f"{label} is refused", True)
+for bad in ("204, x", "0", "5000"):
+    try:
+        P.parse_words(bad)
+        ok(f"words '{bad}' are refused", False)
+    except ValueError:
+        ok(f"words '{bad}' are refused", True)
+ok("words parse with commas or spaces", P.parse_words("204, 409 614") ==
+   [204, 409, 614] and P.parse_words("") == [])
+
+
+def zero_span_app(out, **cfg):
+    root, app = build(out, **cfg)
+    app.an.inst.state.update({"FREQ:SPAN": "0", "FREQ:CENT": "9.19263177E+009",
+                              "FREQ:STAR": "9.19263177E+009",
+                              "FREQ:STOP": "9.19263177E+009",
+                              "SWE:TIME": "1.0E-001", "DET": "SAMP",
+                              "BAND": "1.0E+006", "BAND:VID": "1.0E+006",
+                              "POW:ATT": "+3.000E+01",
+                              "DISP:WIND:TRAC:Y:RLEV": "+2.0E+01",
+                              "TRIG:SOUR": "EXT"})
+    return root, app
+
+
+out = os.path.join(TMP, "zerospan")
+root, app = zero_span_app(out)
+high = root.winfo_reqheight()
+ok("the panel fits a 1080-line screen", high <= 1000, f"{high} px")
+app.an.inst.trace_fn = lambda n: staircase(n)[1]
+app._grab_runs([""], [None], [None])
+root.update()
+log = said(app)
+names = sorted(os.path.basename(f) for f in glob.glob(os.path.join(out, "*")))
+ok("a zero-span grab is named for it and its CSV is headed in seconds",
+   names[0] == f"esa test_zerospan_9.19263GHz_{stamp}.csv"
+   and open(os.path.join(out, names[0])).readline().strip()
+   == "Time (s),dBm", str(names))
+ok("the log says the sweep waits for its trigger",
+   any("waiting for the external trigger" in line for line in log))
+ok("the panel's plot is labelled in time",
+   getattr(app.last_plot[0], "xlabel", "").startswith("Time"))
+
+app.open_steps()
+dlg = app.steps_dialog
+dlg.win.withdraw()
+v = app.steps
+v["first"].set("4e-3")
+v["length"].set("5e-3")
+v["period"].set("10e-3")
+v["count"].set("8")
+v["words"].set(", ".join(str(w) for w in WORDS))
+v["table"].set(True)
+out = os.path.join(TMP, "steps")
+app.outdir.set(out)
+dlg._capture_worker(dlg.params())
+root.update()
+log = said(app)
+base = os.path.join(out, f"esa test_steps_9.19263GHz_{stamp}")
+ok("a staircase capture writes levels, traces, plot, notes and the table",
+   all(os.path.exists(base + e) for e in
+       (".csv", "_traces.csv", ".png", ".txt", "_amplitude_table.txt")),
+   str(os.listdir(out)))
+rows = np.genfromtxt(base + ".csv", delimiter=",", skip_header=1)
+ok("one row a step, with its word and level",
+   rows.shape[0] == 8 and list(rows[:, 2]) == WORDS
+   and np.max(np.abs(rows[:, 7] - true)) < 0.05)
+table = P.read_table(open(base + "_amplitude_table.txt",
+                          encoding="utf-8").read())
+ok("the table on disk has 1 W at word 1577 and says how it was measured",
+   abs(dict((round(f * 4095), pw) for pw, f in table)[1577] - 1) < 1e-6
+   and "MEASURED" in open(base + "_amplitude_table.txt").read()
+   and "pi" in open(base + "_amplitude_table.txt").read())
+text = open(base + ".txt", encoding="utf-8").read()
+ok("the notes carry the method, the trigger settings and every step",
+   "middle 60%" in text and "(TRIG:SOUR EXT)" in text
+   and text.count("word ") >= 8)
+tt, traces = P.read_traces(base + "_traces.csv")
+ok("the traces file reads back", len(traces) == 1 and len(tt) == 401)
+
+# A power scan: one level a trigger, the steps counted across captures.
+count = {"n": 0}
+
+
+def one_pulse(n):
+    word = WORDS[count["n"] % len(WORDS)]
+    count["n"] += 1
+    t1 = np.linspace(0.0, 0.1, n)
+    y1 = np.full(n, -70.0)
+    y1[(t1 >= 20e-3) & (t1 < 60e-3)] = chain_dbm(word)
+    return y1 + np.random.default_rng(count["n"]).normal(0, 0.05, n)
+
+
+app.an.inst.trace_fn = one_pulse
+v["length"].set("")
+v["period"].set("")
+v["count"].set("1")
+v["captures"].set("8")
+out = os.path.join(TMP, "series")
+app.outdir.set(out)
+dlg._capture_worker(dlg.params())
+root.update()
+said(app)
+base = os.path.join(out, f"esa test_steps_9.19263GHz_{stamp}")
+rows = np.genfromtxt(base + ".csv", delimiter=",", skip_header=1)
+ok("eight triggers of one burst each give the same eight levels",
+   rows.shape[0] == 8 and list(rows[:, 1]) == list(range(1, 9))
+   and np.max(np.abs(rows[:, 7] - true)) < 0.05
+   and len(P.read_traces(base + "_traces.csv")[1]) == 8)
+
+app.an.inst.triggers = False
+app.timeout_s.set("0.3")
+v["captures"].set("1")
+out = os.path.join(TMP, "notrigger")
+app.outdir.set(out)
+app.an.inst.sent.clear()
+dlg._capture_worker(dlg.params())
+root.update()
+log = said(app)
+ok("no trigger: the sweep is aborted, said so, and nothing is written",
+   "ABOR" in app.an.inst.sent and not glob.glob(os.path.join(out, "*"))
+   and any("no external trigger arrived" in line for line in log),
+   str(log[-3:]))
+app.an.inst.triggers = True
+app.an.inst.state["FREQ:SPAN"] = "1.0E+009"
+dlg._capture_worker(dlg.params())
+root.update()
+ok("outside zero span it refuses rather than read a spectrum as steps",
+   any("not in zero span" in line for line in said(app))
+   and not glob.glob(os.path.join(out, "*")))
+v["words"].set("")
+try:
+    dlg.params()
+    ok("a table without words is refused before anything is armed", False)
+except ValueError:
+    ok("a table without words is refused before anything is armed", True)
+app.save_config()
+cfg = json.load(open(app.config_path(), encoding="utf-8"))
+ok("the window's boxes are kept in the panel's config",
+   cfg.get("steps_count") == "1" and cfg.get("steps_table") is True)
+dlg.close()
+ok("closing the window leaves the panel working",
+   app.steps_dialog is None)
+app.set_busy(False)
 root.update()
 root.destroy()
 

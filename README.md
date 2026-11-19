@@ -84,6 +84,65 @@ with E4405B() as an:
 `python tests/test_e4405b.py` is its offline check, in the manner of
 `tests/test_grab.py`.
 
+## Power against time, and power steps (E4405B)
+
+With the span at zero the E4405B is a tuned power meter: the trace is power
+against time at one frequency. GRAB works there as anywhere - the CSV is
+headed `Time (s)`, the plot's x axis is seconds after the trigger - and the
+settings grid has a **Trigger** group (Free run / Video / Line / External,
+the external slope, and an offset that may be negative to start the sweep
+before the trigger). A sweep armed on a trigger waits for it for as long as
+the measurement timeout.
+
+What this unit can and cannot resolve (measured 19 Nov 2026; it has no fast
+digitiser option): a trace point is never shorter than **10 us**. The shortest
+sweep is 4 ms at 401 points and 82 ms at 8192. A step of a millisecond or
+more is measured well; a 0.12 ms shaped pulse is twelve points.
+
+**Power steps...** (in the Acquisition box) opens the window that turns this
+into a calibration of a source's drive levels - written for the DDS
+microwave chain, where the pulse compiler converts a typed power into a
+12-bit amplitude word and the chain converts the word into microwaves:
+
+1. *Set zero span* parks the analyser on the carrier with a sample detector.
+   Choose the trigger, the attenuation and the reference level in the grid.
+2. Play the levels: all in one sequence (*Steps per capture*), or one a
+   cycle as a power scan does (*Captures* = the number of points; the
+   analyser is armed again for each trigger).
+3. *CAPTURE STEPS* reads each step as the mean power of its middle 60 %.
+   Leave the step length blank and the steps are found as bursts more than
+   the threshold above the floor - right for pulses with gaps between them.
+4. Type the amplitude words that were played and each level is set against
+   "power proportional to the word squared"; tick the box and the result is
+   also written as `..._amplitude_table.txt`, the file dds-control's Cal-V2
+   compiler and Freq-Scan-GUI read (power in W against word / 4095), scaled
+   so that one word keeps one power - by default word 1577 at 1 W, what the
+   compiler's built-in table gives, so pulses near 1 W change least.
+
+Files share the base `<title>_steps_<carrier>_<date>`: `.csv` (one row a
+step), `_traces.csv` (every capture as it came), `.png`, `.txt`. *Analyse
+saved traces...* redoes the arithmetic on a `_traces.csv` with different
+timing or words, and `python powersteps.py --help` does the same with no
+panel.
+
+Three things decide whether the numbers mean anything:
+
+- **The analyser compresses too.** More than about -10 dBm at its mixer
+  (the level minus the attenuation) and its own front end flattens the top
+  of the curve - which looks exactly like the amplifier compression being
+  looked for. A capture like that is marked SUSPECT. The test is to add
+  10 dB of attenuation: the levels must not move.
+- **Relative, not absolute.** The analyser is good to about a decibel
+  absolutely and several times better from level to level at fixed
+  settings, which is all a table needs. Do not change attenuation, RBW or
+  reference level part way through a set of steps.
+- **Never the power amplifier's output directly.** The input is damaged
+  above 1 W (+30 dBm). Measure through a directional coupler and attenuator.
+
+Nothing is copied into the DDS folder. A table changes the area of every
+pulse, so it goes in by hand, when the pi powers are about to be measured
+again.
+
 ## The plot
 
 The last plot sits in the panel, under **Last plot**, drawn from the trace data

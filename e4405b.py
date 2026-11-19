@@ -43,6 +43,16 @@ back into bugs:
 * Writing a bandwidth, sweep time or attenuation switches its auto-coupling
   off; write_settings sends the auto switches first so a value sent alongside
   one wins, and the panel reads everything back afterwards.
+* **Zero span** (power against time at one frequency; measured 19 Nov 2026).
+  This unit has no fast-digitiser option, so a point is never shorter than
+  10 us: the shortest sweep is 4 ms at 401 points and 81.91 ms at 8192, and
+  a shorter one asked for is clamped without an error. RBW and sweep time
+  cannot be auto-coupled there (+619, +620), so those two autos are written
+  after the frequencies when a change leaves zero span. The trigger slope is
+  `TRIG:EXT:SLOP` - `TRIG:SLOP` is an undefined header. `TRIG:DEL` refuses a
+  negative delay; `TRIG:OFFS`, zero span only, takes either sign. Armed on an
+  external trigger that never comes, the sweep waits for ever and wait_done
+  returns 'timeout': abort() it.
 
 Requires: pyvisa + a VISA runtime with GPIB (NI-488.2 on this machine), numpy.
 """
@@ -73,6 +83,8 @@ __all__ = [
     "fmt_hz", "parse_hz", "parse_segments", "tile_segments", "sweep_count",
     "capture_time", "sweep_fault", "flat_fault", "band_fault",
     "readout_fault", "zero_span", "resolution_note", "plot_bits",
+    "level_fault", "waits_for_trigger", "min_zero_span_sweep",
+    "power_vs_time", "time_origin", "MIXER_LIMIT_DBM", "ZERO_SPAN_POINT_S",
     "metadata_text", "floor_fault", "fmt_hms", "read_csv", "safe_name",
     "unique_base", "write_csv", "BAD_NAME_CHARS", "SPACE_OWNERS",
 ]
@@ -148,6 +160,19 @@ SETTING_GROUPS = [
              BOOL_ALIASES),
         enum("Sweep", "CONT", "INIT:CONT",
              (("Single", "0"), ("Continuous", "1")), BOOL_ALIASES),
+    ]),
+    # TRIG:OFFS rather than TRIG:DEL: it is the one that takes a negative
+    # time, which starts the sweep before the trigger. Zero span only.
+    ("Trigger", [
+        enum("Trigger", "TRIGSRC", "TRIG:SOUR",
+             (("Free run", "IMM"), ("Video", "VID"), ("Line", "LINE"),
+              ("External", "EXT"))),
+        enum("Ext slope", "TRIGSLOPE", "TRIG:EXT:SLOP",
+             (("Rising", "POS"), ("Falling", "NEG"))),
+        num("Offset (s)", "TRIGOFF", "TRIG:OFFS"),
+        enum("Offset on", "TRIGOFFON", "TRIG:OFFS:STAT", OFF_ON,
+             BOOL_ALIASES),
+        num("Video level", "TRIGLEV", "TRIG:VID:LEV"),
     ]),
     ("Amplitude", [
         num("Ref level", "RLEV", "DISP:WIND:TRAC:Y:RLEV"),
@@ -452,6 +477,16 @@ def resolution_note(snap):
     it - a survey that looks clean because the carrier fell between points."""
     span, points = value_of(snap, "FSPAN"), value_of(snap, "POINTS")
     rbw = value_of(snap, "RBW")
+    if zero_span(snap):
+        swt = value_of(snap, "SWT")
+        if not swt or not points or points < 2:
+            return ""
+        text = f"{swt / (points - 1) * 1e6:.4g} us a point"
+        if rbw:
+            # The resolution filter is what limits an edge: about 1/RBW.
+            text += (f", RBW {fmt_hz(rbw)} (an edge takes about "
+                     f"{1e6 / rbw:.3g} us to settle)")
+        return text
     if not span or not points or points < 2 or not rbw:
         return ""
     bucket = span / (points - 1)
@@ -460,6 +495,83 @@ def resolution_note(snap):
         text += (" - points are further apart than the RBW and the detector "
                  "is Sample, so a narrow signal between points is missed")
     return text
+
+
+# Above this at the first mixer the analyser itself starts to compress, and
+# what it then reports as the source flattening off is its own front end.
+# -10 dBm is the level the ESA's specifications are written for.
+MIXER_LIMIT_DBM = -10.0
+
+
+def level_fault(snap, amps):
+    """Why the top of this trace may read low, or ''. dBm traces only.
+
+    Two separate ways. A peak above the reference level is off the top of the
+    screen, where the log amplifier is not specified. And a peak that puts
+    more than MIXER_LIMIT_DBM on the mixer - the level minus the input
+    attenuation - is compressed by the analyser, which matters most exactly
+    when the thing being measured is another device's compression: add
+    attenuation until 10 dB more of it no longer changes the reading."""
+    if trace_units(snap) != "dBm" or not len(amps):
+        return ""
+    peak = float(np.nanmax(amps))
+    faults = []
+    rlev, att = value_of(snap, "RLEV"), value_of(snap, "ATT")
+    if rlev is not None and peak > rlev:
+        faults.append(f"the peak, {peak:.1f} dBm, is above the reference "
+                      f"level ({rlev:g} dBm)")
+    if att is not None and peak - att > MIXER_LIMIT_DBM:
+        faults.append(f"the peak, {peak:.1f} dBm, behind {att:g} dB of "
+                      f"attenuation is {peak - att:.1f} dBm at the mixer, "
+                      f"above {MIXER_LIMIT_DBM:g} dBm where the analyser "
+                      f"compresses - raise the attenuation")
+    return "; ".join(faults)
+
+
+def waits_for_trigger(snap):
+    """The trigger a sweep will wait on, as the panel names it, or '' for
+    free run. A sweep armed on one starts when it comes and not before."""
+    source = token_of(snap, "TRIGSRC")
+    if source in (None, "IMM"):
+        return ""
+    return label_of(snap, "TRIGSRC", source)
+
+
+# Zero span, measured: a trace point is never shorter than this, and the
+# sweep never shorter than 4 ms.
+ZERO_SPAN_POINT_S = 10e-6
+
+
+def min_zero_span_sweep(points):
+    """The shortest zero-span sweep this unit makes at `points` points."""
+    return max(4e-3, ZERO_SPAN_POINT_S * (int(points) - 1))
+
+
+def power_vs_time(center, sweep_time, rbw=1e6, points=401):
+    """The settings for power against time at one frequency, in the order
+    they have to be written: zero span at `center`, a sample detector (a
+    peak detector reads noise high and an unsteady level at its top), the
+    video filter as wide as the resolution filter so it smooths nothing, and
+    power averaging in case averaging is switched on. The trigger is left as
+    it is. Raises ValueError for a sweep this unit cannot make that short."""
+    points = int(points)
+    if not 101 <= points <= 8192:
+        raise ValueError("points have to be 101 to 8192")
+    shortest = min_zero_span_sweep(points)
+    if sweep_time < shortest:
+        raise ValueError(f"at {points} points the shortest zero-span sweep "
+                         f"is {shortest * 1e3:g} ms (10 us a point)")
+    return {"FCENT": f"{center:.12g}", "FSPAN": "0", "POINTS": str(points),
+            "RBW": f"{rbw:.12g}", "VBW": f"{max(rbw, 1.0):.12g}",
+            "SWT": f"{sweep_time:.12g}", "DET": "SAMP", "AVGTYPE": "RMS"}
+
+
+def time_origin(snap):
+    """Where a zero-span trace starts, in seconds after the trigger: the
+    trigger offset when it is on, otherwise zero."""
+    if flag_of(snap, "TRIGOFFON", False):
+        return value_of(snap, "TRIGOFF", 0.0) or 0.0
+    return 0.0
 
 
 def plot_bits(snap, freqs=()):
@@ -832,6 +944,14 @@ class E4405B:
         stop first and moving it downward the start first. Points before the
         frequencies changes nothing, so it keeps its place."""
         wanted = dict(changes)
+        # Leaving zero span: RBW and sweep time cannot be auto-coupled until
+        # the span is no longer zero (+619, +620), so those two autos, when
+        # they are being switched on beside a frequency, go last instead.
+        late = {}
+        if any(k in wanted for k in ("FSTART", "FSTOP", "FCENT", "FSPAN")):
+            for k in ("RBWAUTO", "SWTAUTO"):
+                if str(wanted.get(k, "")).lstrip("+").upper() in ("1", "ON"):
+                    late[k] = wanted.pop(k)
         ordered = {k: wanted.pop(k) for k in AUTO_KEYS if k in wanted}
         if "FSTART" in wanted and "FSTOP" in wanted:
             try:
@@ -848,6 +968,7 @@ class E4405B:
             ordered.update(rest)
         else:
             ordered.update(wanted)
+        ordered.update(late)
         return ordered
 
     def write_settings(self, changes, log=None):
@@ -963,20 +1084,23 @@ class E4405B:
         ASCII, always - see the module docstring for why there is no binary
         path. The frequency axis is laid from the start and stop the analyser
         reports, read here unless a snapshot is handed in, across however many
-        points came back. In zero span x is time in seconds, 0 to the sweep
-        time, and the caller should say so (see `zero_span`)."""
+        points came back. In zero span x is time in seconds after the
+        trigger - the sweep time long, starting at the trigger offset when
+        that is on - and the caller should say so (see `zero_span`)."""
         self.put("FORM ASC")
         amps = np.array(self.inst.query_ascii_values(f"TRAC? TRACE{trace}"),
                         dtype=float)
         if snap is None or "FSTART" not in snap or "FSTOP" not in snap:
             snap = dict(snap or {})
-            snap.update(self.read_settings("FSTART", "FSTOP", "SWT"))
+            snap.update(self.read_settings("FSTART", "FSTOP", "SWT",
+                                           "TRIGOFF", "TRIGOFFON"))
         start, stop = value_of(snap, "FSTART"), value_of(snap, "FSTOP")
         if start is None or stop is None:
             raise RuntimeError("the analyser would not report its start and "
                                "stop frequency, so the trace has no x axis")
         if zero_span(snap):
-            return np.linspace(0.0, value_of(snap, "SWT", 0.0) or 0.0,
+            t0 = time_origin(snap)
+            return np.linspace(t0, t0 + (value_of(snap, "SWT", 0.0) or 0.0),
                                len(amps)), amps
         return np.linspace(start, stop, len(amps)), amps
 
