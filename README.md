@@ -1,6 +1,7 @@
 # Spectrum Grab
 
-One-click trace capture from an SRS SR760 FFT spectrum analyzer over GPIB. This
+One-click trace capture from an SRS SR760 FFT spectrum analyzer over GPIB -
+and, as a second instrument, an Agilent E4405B (see [Two analyzers](#two-analyzers)). This
 is the `read_sr760fft_data*.py` bench scripts rolled into a single program, in
 the same shape as
 [keysight-scope-grab](https://github.com/Weiss-Quantum-Computing/keysight-scope-grab):
@@ -18,6 +19,70 @@ and pan; **Open PNG** opens the full-resolution file. **Peek** draws the trace
 onto the panel without writing anything, and **Start average** restarts the
 average and waits it out without writing anything either - so looking is never
 the same as collecting.
+
+## Two analyzers
+
+The box at the left of the **Analyzer** row picks the instrument: **SR760** (the
+FFT analyzer this program was written for, and everything below unless it says
+otherwise) or **E4405B** (the Agilent / HP ESA-E spectrum analyzer, 9 kHz to
+13.2 GHz, at `GPIB0::18::INSTR`). Picking the other one rebuilds the window as
+that instrument's panel; the choice is remembered for the next start, and each
+panel keeps its own saved boxes (`config.json` and `config_e4405b.json` in
+`%APPDATA%\SpectrumGrab`).
+
+The two share the output folder and file layout, GRAB / Peek / Stop, auto-grab,
+the plot, Compare and the log. The rest of the E4405B panel is its own:
+
+- **Settings** are start / stop / center / span, points (101 to 8192), RBW, VBW
+  and sweep time with their auto switches, reference level, attenuation, units,
+  detector, averaging and trace mode. Numbers take a `k` / `M` / `G` suffix.
+  Read and Apply work as on the SR760: edits are starred until applied and
+  everything is read back afterwards, because the analyzer moves whatever is
+  coupled to what you wrote.
+- **GRAB** takes the analyzer to single sweep, triggers one measurement - with
+  averaging on, the whole average - waits for it, reads the status registers
+  and the trace, then by default puts continuous sweep back and returns the
+  front panel to local. Files are `<title>[_case]_<start>-<stop>_<date>`.
+- **Single sweep** does the same and saves nothing, leaving the result on the
+  analyzer's screen. **Peek** reads the trace as it stands without triggering.
+- **Sweep** is cases x **segments**, each segment a `start-stop` band:
+  `9k-100M, 100M-1G, 1G-3G`. *Fill segments* tiles a band into n equal ones,
+  which is how a wide survey gets n times the points. The segments of a case
+  are joined into one CSV with a segment column, as a stitch is on the SR760,
+  and the analyzer is put back on the band it started on.
+- A trace is marked **SUSPECT** - in the metadata, the log and on the plot -
+  for Meas Uncal (swept too fast), IF/ADC over range, an unlocked reference, a
+  failed alignment, a measurement that timed out, trace 1 in View or Blank, a
+  flat trace, or a band the analyzer did not actually go to. **Align Needed**
+  is a caution on every amplitude rather than a fault in one trace, so it gets
+  its own metadata line and a line under the settings; *Align now* runs the
+  alignment.
+- There is no range hold, overlap or settle in record lengths: those are the
+  SR760's.
+
+**Traces are read in ASCII, deliberately.** On this analyzer (s/n MY41440490,
+18 Nov 2026) every binary trace format arrives with the top bit of each byte
+cleared, so -55.8 dBm reads as +55.8; the SR760 on the same GPIB board is
+unaffected, which puts the fault in the E4405B's cable or its GPIB port (DIO8).
+ASCII is immune and takes 0.05 s for 401 points.
+
+`e4405b.py` is the instrument layer and scripting library, the sibling of
+`sr760.py`; `esa_panel.py` is the panel. Both sit beside `spectrum_grab.py`.
+
+```python
+from e4405b import E4405B
+
+with E4405B() as an:
+    an.write_settings({"FSTART": "88e6", "FSTOP": "108e6", "POINTS": "801"})
+    an.start()                         # one sweep, or one whole average
+    an.wait_done(60)
+    status = an.refresh_status()       # .faults(), .alignment()
+    f, a = an.trace()                  # Hz, and the analyzer's current units
+    an.resume()                        # continuous sweep back, if it was on
+```
+
+`python tests/test_e4405b.py` is its offline check, in the manner of
+`tests/test_grab.py`.
 
 ## The plot
 

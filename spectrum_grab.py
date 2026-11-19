@@ -34,6 +34,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
+import sr760
+
 # The instrument layer lives in sr760.py, beside this file - the command
 # spellings, the settings model, the status handling and the file format are
 # shared with anything that scripts the analyzer rather than driving it from
@@ -377,13 +379,71 @@ def save_plot(path, traces, title, subtitle, ylabel, ymin, ymax, legend=True,
 # GUI
 # ---------------------------------------------------------------------------
 
+# The analyzers this program can drive, in the order the selector lists them.
+# The SR760 panel is App, below. Every other one is a subclass of it in a module
+# of its own, imported only when it is picked - see panel_class().
+INSTRUMENTS = ("SR760", "E4405B")
+
+
+def instrument_path():
+    """Where the last-used instrument is remembered: beside the config, and
+    worked out when asked rather than at import so it follows CONFIG_PATH."""
+    return os.path.join(os.path.dirname(CONFIG_PATH), "instrument.txt")
+
+
+def remembered_instrument():
+    try:
+        with open(instrument_path(), encoding="utf-8") as fh:
+            name = fh.read().strip()
+    except OSError:
+        return INSTRUMENTS[0]
+    return name if name in INSTRUMENTS else INSTRUMENTS[0]
+
+
+def remember_instrument(name):
+    try:
+        os.makedirs(os.path.dirname(instrument_path()), exist_ok=True)
+        with open(instrument_path(), "w", encoding="utf-8") as fh:
+            fh.write(name)
+    except OSError:
+        pass
+
+
+def panel_class(name):
+    """The panel for an instrument. Imported here rather than at the top
+    because esa_panel imports this module for App."""
+    if name == "E4405B":
+        import esa_panel
+        return esa_panel.EsaApp
+    return App
+
+
 class App:
     last_ylabel = "dBV"       # unit of the most recent snapshot, for sweep plots
     last_yscale = "linear"    # ... and the axis the analyzer draws it on
 
+    # What a panel for another analyzer overrides. `drv` is the instrument
+    # module the settings grid is read through - its BY_KEY, fmt_setting,
+    # parse_setting, trace_units and trace_yscale - so the grid's bookkeeping
+    # is one piece of code whichever analyzer is behind it.
+    INSTRUMENT = "SR760"
+    WINDOW_TITLE = "Spectrum Grab - SR760 FFT"
+    DEFAULT_TITLE = "sr760"
+    DEFAULT_ADDR = DEFAULT_ADDRESS
+    drv = sr760
+
+    def make_analyzer(self):
+        return SR760(connect=False, log=self.log)
+
+    def config_path(self):
+        """Read when used, not at import: the tests point CONFIG_PATH at a
+        temp file after this module has loaded."""
+        return CONFIG_PATH
+
     def __init__(self, root):
         self.root = root
-        self.an = SR760(connect=False, log=self.log)
+        self.closed = False
+        self.an = self.make_analyzer()
         self.msgs = queue.Queue()
         self.busy = False
         self.abort = threading.Event()
@@ -419,7 +479,7 @@ class App:
         self.pinned_at = ""
         self.settle_due = threading.Event()
 
-        root.title("Spectrum Grab - SR760 FFT")
+        root.title(self.WINDOW_TITLE)
 
         pad = dict(padx=8, pady=4)
         body = ttk.Frame(root)
@@ -482,8 +542,15 @@ class App:
         f.pack(fill="x", **pad)
         row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=6)
+        # Which analyzer this panel is for. Picking the other one rebuilds the
+        # window as that instrument's panel - see switch_instrument.
+        self.instrument = tk.StringVar(value=self.INSTRUMENT)
+        pick = ttk.Combobox(row, textvariable=self.instrument,
+                            values=list(INSTRUMENTS), width=8, state="readonly")
+        pick.pack(side="left", padx=(0, 10))
+        pick.bind("<<ComboboxSelected>>", self.switch_instrument)
         ttk.Label(row, text="Address:").pack(side="left")
-        self.addr = tk.StringVar(value=DEFAULT_ADDRESS)
+        self.addr = tk.StringVar(value=self.DEFAULT_ADDR)
         ttk.Entry(row, textvariable=self.addr, width=22).pack(side="left", padx=6)
         self.connect_btn = ttk.Button(row, text="Connect", command=self.do_connect)
         self.connect_btn.pack(side="right")
@@ -506,7 +573,7 @@ class App:
         row = ttk.Frame(f)
         row.pack(fill="x", padx=6, pady=2)
         ttk.Label(row, text="Title:").pack(side="left")
-        self.title = tk.StringVar(value="sr760")
+        self.title = tk.StringVar(value=self.DEFAULT_TITLE)
         ttk.Entry(row, textvariable=self.title).pack(side="left", fill="x",
                                                      expand=True, padx=6)
 
@@ -894,6 +961,8 @@ class App:
         self.msgs.put(text)
 
     def pump(self):
+        if self.closed:                    # the window now belongs to another
+            return                         # panel, or to nobody
         while not self.msgs.empty():
             self.logbox.insert("end", self.msgs.get() + "\n")
             self.logbox.see("end")
@@ -908,7 +977,7 @@ class App:
     def safe_title(self):
         t = "".join("_" if c in BAD_NAME_CHARS else c
                     for c in self.title.get()).strip()
-        return t or "sr760"
+        return t or self.DEFAULT_TITLE
 
     def target_dir(self):
         r"""Where this session writes. The dated subfolder reproduces the
@@ -1097,14 +1166,14 @@ class App:
         """Restore what the last session was using. Anything missing, malformed
         or of the wrong type is ignored and leaves the default in place."""
         try:
-            with open(CONFIG_PATH, encoding="utf-8") as fh:
+            with open(self.config_path(), encoding="utf-8") as fh:
                 cfg = json.load(fh)
             if not isinstance(cfg, dict):
                 raise ValueError("not a JSON object")
         except FileNotFoundError:
             return
         except Exception as exc:
-            self.log(f"Ignoring unreadable {CONFIG_PATH}: {exc}")
+            self.log(f"Ignoring unreadable {self.config_path()}: {exc}")
             return
 
         for key, var in self.config_vars().items():
@@ -1120,7 +1189,7 @@ class App:
             if paths:
                 self.set_compare(paths, "restored from the last session")
         self.saved_cfg = self.current_cfg()
-        self.log(f"Restored last session from {CONFIG_PATH}")
+        self.log(f"Restored last session from {self.config_path()}")
 
     def save_config(self):
         """Called after a grab, when the folder is picked, and on close. Writes
@@ -1129,12 +1198,12 @@ class App:
         if cfg == self.saved_cfg:
             return
         try:
-            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+            os.makedirs(os.path.dirname(self.config_path()), exist_ok=True)
+            with open(self.config_path(), "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
             self.saved_cfg = cfg
         except Exception as exc:
-            self.log(f"Could not save {CONFIG_PATH}: {exc}")
+            self.log(f"Could not save {self.config_path()}: {exc}")
 
     # -- actions ----------------------------------------------------------
 
@@ -1151,6 +1220,8 @@ class App:
         # Connecting drops the VISA session and opens a new one, so it has to
         # wait its turn like everything else - otherwise the startup auto-connect
         # or an impatient click would pull the instrument out from under a sweep.
+        if self.closed:
+            return
         if self.busy:
             self.log("Busy - stop the current job before reconnecting.")
             return
@@ -2374,7 +2445,7 @@ class App:
         """What the plot is of, in the words that were typed - the file name is
         already on the file, and its underscored, span-coded form made a poor
         heading for a picture that ends up in a talk or a logbook."""
-        parts = [self.title.get().strip() or "sr760"]
+        parts = [self.title.get().strip() or self.DEFAULT_TITLE]
         if case:
             parts.append(case)
         title = " - ".join(parts)
@@ -2737,8 +2808,8 @@ class App:
         an Apply, when the analyzer is the authority on what took effect."""
         kept = 0
         for key, raw in values.items():
-            s = BY_KEY[key]
-            value = fmt_setting(s, raw)
+            s = self.drv.BY_KEY[key]
+            value = self.drv.fmt_setting(s, raw)
             was_edited = self.edited(key)
             self.set_inst[key] = value
             if overwrite or not was_edited:
@@ -2746,8 +2817,8 @@ class App:
             elif self.set_vars[key].get().strip() != value:
                 kept += 1
         if values:
-            self.last_ylabel = trace_units(values)
-            self.last_yscale = trace_yscale(values)
+            self.last_ylabel = self.drv.trace_units(values)
+            self.last_yscale = self.drv.trace_yscale(values)
         if "ARNG" in values:
             self.arng_live.set(code_of(values, "ARNG", 0) == 1)
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -2791,7 +2862,8 @@ class App:
             if not self.edited(key):
                 continue
             try:
-                changes[key] = parse_setting(BY_KEY[key], var.get())
+                changes[key] = self.drv.parse_setting(self.drv.BY_KEY[key],
+                                                      var.get())
             except ValueError:
                 self.log(f"  {key}: '{var.get()}' is not a valid value, skipped")
         if not changes:
@@ -2850,6 +2922,7 @@ class App:
         """Main thread. Show what the analyzer reported, then say plainly which
         writes did not stick and let the rest stand."""
         self.show_settings(values, overwrite=bool(changes))
+        BY_KEY, fmt_setting = self.drv.BY_KEY, self.drv.fmt_setting
         for key, code in sorted((changes or {}).items()):
             if key not in values:
                 continue
@@ -2898,16 +2971,59 @@ class App:
             self.do_grab()
         self.auto_job = self.root.after(ms, self.schedule_auto)
 
-    def on_close(self):
+    def shutdown(self):
+        """Everything closing the panel has to do short of destroying the
+        window, which switch_instrument keeps."""
         self.save_config()
         self.abort.set()
         self.auto.set(False)
         self.toggle_auto()
         self.an.close()
+        self.closed = True
+
+    def on_close(self):
+        self.shutdown()
         self.root.destroy()
+
+    def switch_instrument(self, _event=None):
+        """Rebuild the window as the other analyzer's panel.
+
+        A rebuild rather than a mode inside one panel: the two instruments
+        share the folder, the plot, the comparison and the log, and almost
+        nothing else - span codes, overlap and a range hold on one side,
+        start/stop, bandwidths and attenuation on the other - so each gets a
+        panel that says only what is true of it. Each keeps its own config
+        file, and the choice itself is remembered for the next start.
+        """
+        name = self.instrument.get()
+        if name == self.INSTRUMENT:
+            return
+        if self.busy:
+            self.log("Busy - stop the current job before changing instrument.")
+            self.instrument.set(self.INSTRUMENT)
+            return
+        try:
+            cls = panel_class(name)
+        except Exception as exc:
+            self.log(f"ERROR: the {name} panel could not be loaded: {exc}")
+            self.instrument.set(self.INSTRUMENT)
+            return
+        remember_instrument(name)
+        self.shutdown()
+        for child in self.root.winfo_children():
+            child.destroy()
+        cls(self.root)
+
+
+def main():
+    root = tk.Tk()
+    panel_class(remembered_instrument())(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    # Through the importable copy of this module, not the __main__ one: the
+    # E4405B panel imports spectrum_grab for App, and a second copy of the
+    # module would give it a different App from the one running.
+    import spectrum_grab
+    spectrum_grab.main()
